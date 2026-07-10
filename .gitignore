@@ -1,0 +1,4 @@
+result.json
+node_modules/
+*.log
+upload.yml
