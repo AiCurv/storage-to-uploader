@@ -1,0 +1,91 @@
+name: Telegram upload
+
+on:
+  repository_dispatch:
+    types: [telegram-upload]
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "HTTP(S) URL to download and upload"
+        required: true
+        type: string
+      filename:
+        description: "Override filename (optional)"
+        required: false
+        type: string
+        default: ""
+      content_type:
+        description: "Override content type (optional)"
+        required: false
+        type: string
+        default: "application/octet-stream"
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      STORAGE_TO_VISITOR_TOKEN: ${{ secrets.STORAGE_TO_VISITOR_TOKEN }}
+      VERCEL_CALLBACK_URL: ${{ secrets.VERCEL_CALLBACK_URL }}
+      VERIFY_TOKEN: ${{ secrets.VERIFY_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pick up inputs from either repository_dispatch (client_payload) or manual dispatch.
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            SOURCE="${{ github.event.client_payload.source_url }}"
+            FILENAME="${{ github.event.client_payload.filename }}"
+            CHAT_ID="${{ github.event.client_payload.chat_id }}"
+            CALLBACK="${{ github.event.client_payload.callback_url }}"
+          else
+            SOURCE="${{ inputs.source }}"
+            FILENAME="${{ inputs.filename }}"
+            CHAT_ID=""
+            CALLBACK=""
+          fi
+          echo "source=$SOURCE"
+          echo "filename=$FILENAME"
+          echo "chat_id=$CHAT_ID"
+
+          ARGS=( "$SOURCE" )
+          [ -n "$FILENAME" ] && ARGS+=( "$FILENAME" )
+
+          set +e
+          node upload.mjs "${ARGS[@]}"
+          STATUS=$?
+          set -e
+          if [ $STATUS -ne 0 ] || [ ! -s result.json ]; then
+            if [ -n "$CHAT_ID" ] && [ -n "$CALLBACK" ]; then
+              curl -fsS -X POST "$CALLBACK" \
+                -H "Content-Type: application/json" \
+                -H "X-Verify: $VERIFY_TOKEN" \
+                -d "{\"chat_id\":\"$CHAT_ID\",\"error\":\"upload script failed (exit $STATUS)\"}" || true
+            fi
+            exit $STATUS
+          fi
+
+          URL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).url||'')")
+          RAW=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).raw_url||'')")
+          SIZE=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).size||0)")
+          FNAME=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).filename||'')")
+          echo "::notice title=storage.to link::$URL"
+          echo "::notice title=raw link::$RAW"
+
+          if [ -n "$CHAT_ID" ] && [ -n "$CALLBACK" ]; then
+            PAYLOAD=$(node -e "console.log(JSON.stringify({chat_id:process.env.CHAT_ID,url:process.env.URL,raw_url:process.env.RAW,filename:process.env.FNAME,size_bytes:Number(process.env.SIZE)}))" )
+            CHAT_ID="$CHAT_ID" URL="$URL" RAW="$RAW" FNAME="$FNAME" SIZE="$SIZE" \
+            curl -fsS -X POST "$CALLBACK" \
+              -H "Content-Type: application/json" \
+              -H "X-Verify: $VERIFY_TOKEN" \
+              -d "$PAYLOAD" || true
+          fi
