@@ -1,6 +1,10 @@
 {
+  "version": 2,
+  "buildCommand": null,
+  "outputDirectory": "api",
   "functions": {
     "api/webhook.js": { "maxDuration": 10 },
-    "api/start.js": { "maxDuration": 10 }
+    "api/start.js": { "maxDuration": 10 },
+    "api/result.js": { "maxDuration": 10 }
   }
 }
