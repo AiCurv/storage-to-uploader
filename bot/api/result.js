@@ -29,7 +29,7 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end();
 
   // Shared-secret check. Header name "x-verify" matches what the workflow sends.
-  const expected = process.env.VERIFY_TOKEN || "";
+  const expected = process.env.BOT_VERIFY_TOKEN || "";
   if (!expected) return res.status(500).json({ ok: false, error: "verify not configured" });
   const got = req.headers["x-verify"] || req.headers["X-Verify"];
   if (got !== expected) return res.status(401).json({ ok: false, error: "bad verify token" });
