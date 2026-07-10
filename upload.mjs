@@ -43,11 +43,37 @@ async function api(path, body) {
   return json;
 }
 
+// Host-specific resolvers: turn a user-pasted URL into a direct download URL
+// with the right headers. Some hosts block bot UAs or require path munging.
+// Add a new case here when you hit a host that 403s.
+const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+function resolveSource(rawUrl) {
+  const u = new URL(rawUrl);
+  const host = u.hostname.toLowerCase();
+
+  // Pixeldrain: /api/file/<id> 403s without a browser UA, and
+  // /api/file/ serves a "Click here to download" HTML wrapper.
+  // The real bytes are at /api/file/<id>?download - but the cleanest
+  // direct path is /u/<id> which streams the file with a 200 + UA.
+  if (host === "pixeldrain.com" || host === "www.pixeldrain.com") {
+    const m = u.pathname.match(/^\/(?:api\/file|d)\/([A-Za-z0-9]+)/);
+    if (m) {
+      const fixed = new URL(`/u/${m[1]}${u.search}`, u);
+      return { url: fixed.toString(), headers: {} };
+    }
+  }
+
+  // Default: pass-through with a browser UA so most CDNs don't 403 us.
+  return { url: rawUrl, headers: { "User-Agent": UA } };
+}
+
 async function getSource(src) {
   if (/^https?:\/\//i.test(src)) {
-    log("downloading source:", src);
-    const r = await fetch(src);
-    if (!r.ok) throw new Error(`source fetch ${r.status} ${src}`);
+    const { url, headers } = resolveSource(src);
+    log("downloading source:", url);
+    const r = await fetch(url, { redirect: "follow", headers });
+    if (!r.ok) throw new Error(`source fetch ${r.status} ${url}`);
     const sizeHeader = r.headers.get("content-length");
     const buf = Buffer.from(await r.arrayBuffer());
     const filename = guessFilename(src, r.headers.get("content-disposition"));

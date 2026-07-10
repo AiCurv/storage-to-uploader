@@ -41,6 +41,30 @@ function mainMenu() {
   };
 }
 
+// Convert known "share page" URLs into the underlying direct-download URL.
+// Gofile, pixeldrain, and similar hosts serve an HTML landing page on the
+// share link and a separate raw URL. We translate here so the workflow
+// fetches bytes, not HTML.
+function normalizeSourceUrl(text) {
+  let url;
+  try { url = new URL(text.trim()); } catch { return null; }
+  const host = url.host.toLowerCase();
+  const path = url.pathname;
+
+  // pixeldrain: https://pixeldrain.com/u/<id>  ->  https://pixeldrain.com/api/file/<id>
+  if (host === "pixeldrain.com" || host.endsWith(".pixeldrain.com")) {
+    const m = path.match(/^\/u\/([A-Za-z0-9]+)/);
+    if (m) return `https://pixeldrain.com/api/file/${m[1]}`;
+  }
+
+  // gofile: /d/<id> shares a page; the raw download requires a token
+  // fetched at runtime. We leave the page URL for the user to translate
+  // manually, but if a /download/web/<id>/<name> URL is already in hand
+  // we pass it through (no rewrite needed).
+
+  return null; // no rewrite - pass through to the workflow
+}
+
 function looksLikeUrl(text) {
   return /^https?:\/\/\S+$/i.test(text);
 }
@@ -129,9 +153,11 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   }
 
-  const filename = filenameFromUrl(text);
+  // Translate known share-page URLs (e.g. pixeldrain) to their direct links.
+  const sourceUrl = normalizeSourceUrl(text) || text;
+  const filename = filenameFromUrl(sourceUrl);
   try {
-    await triggerUpload(text, filename, chatId);
+    await triggerUpload(sourceUrl, filename, chatId);
     await sendMessage(chatId, `⏬ Queued <code>${filename}</code>\nUploading... I'll message you when it's done.`, mainMenu());
   } catch (err) {
     await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
