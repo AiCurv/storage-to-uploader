@@ -21,48 +21,41 @@ function cryptoRandom() {
 }
 
 function log(...a) {
-  console.log(`[storage-to] ${new Date().toISOString()}`, ...a);
+  console.error(`[storage-to] ${new Date().toISOString()}`, ...a);
 }
 
-async function fetchRemote(url) {
+function emitResult(obj) {
+  // Machine-readable block for CI to extract
+  console.log("RESULT_JSON_BEGIN");
+  console.log(JSON.stringify(obj, null, 2));
+  console.log("RESULT_JSON_END");
+}
+
+async function readResponseBody(r) {
+  const buf = Buffer.from(await r.arrayBuffer());
+  return { buf, text: buf.toString("utf8") };
+}
+
+async function downloadToBuffer(url) {
   log("downloading source:", url);
   const r = await fetch(url, { redirect: "follow" });
-  if (!r.ok) throw new Error(`download failed: ${r.status} ${r.statusText}`);
-  const total = Number(r.headers.get("content-length") || 0);
-  log("downloaded headers, content-length:", total || "unknown");
-  return { stream: r.body, size: total, filename: filenameFrom(url, r) };
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`download failed: ${r.status} ${r.statusText} ${t.slice(0, 200)}`);
+  }
+  const buf = Buffer.from(await r.arrayBuffer());
+  const cd = r.headers.get("content-disposition") || "";
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
+  const filename = m ? decodeURIComponent(m[1]) : url.split("/").pop().split("?")[0] || "file.bin";
+  const contentType = r.headers.get("content-type") || "application/octet-stream";
+  log(`downloaded ${buf.length} bytes, filename guess: ${filename}`);
+  return { buffer: buf, filename, contentType };
 }
 
-function filenameFrom(url, resp) {
-  const cd = resp.headers.get("content-disposition") || "";
-  const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
-  if (m) return decodeURIComponent(m[1]);
-  try {
-    const u = new URL(url);
-    const last = u.pathname.split("/").filter(Boolean).pop();
-    if (last) return last;
-  } catch {}
-  return "upload.bin";
-}
-
-function localSource(path) {
+function readLocalFile(path) {
   if (!existsSync(path)) throw new Error(`file not found: ${path}`);
   const size = statSync(path).size;
   return { stream: createReadStream(path), size, filename: basename(path) };
-}
-
-function streamToBuffer(stream) {
-  // For small files (e.g. test payloads) we buffer; for big files we pipe.
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on("data", (c) => chunks.push(c));
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-    stream.on("error", reject);
-  });
-}
-
-function nodeStreamToWeb(stream) {
-  return Readable.toWeb(stream);
 }
 
 async function api(path, body) {
@@ -75,122 +68,100 @@ async function api(path, body) {
     },
     body: JSON.stringify(body),
   });
-  const text = await r.text();
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new Error(`bad JSON from ${path}: ${r.status} ${text.slice(0, 200)}`);
-  }
-  if (!r.ok || json.success === false) {
-    throw new Error(`api ${path} failed: ${r.status} ${JSON.stringify(json)}`);
-  }
-  return json;
-}
-
-async function putParts(r2Key, partSize, totalParts, initialUrls, getStream) {
-  const partUrls = new Map();
-  for (const [k, v] of Object.entries(initialUrls || {})) {
-    partUrls.set(Number(k), v);
-  }
-
-  const completed = [];
-  for (let n = 1; n <= totalParts; n++) {
-    if (!partUrls.has(n)) {
-      const need = [];
-      for (let i = 1; i <= totalParts; i++) if (!partUrls.has(i)) need.push(i);
-      const extra = await api("/upload/parts", {
-        upload_id: r2Key,
-        part_numbers: need,
-      });
-      for (const p of extra.part_urls) partUrls.set(p.partNumber, p.url);
-    }
-    const url = partUrls.get(n);
-    if (!url) throw new Error(`no url for part ${n}`);
-
-    const start = (n - 1) * partSize;
-    const end = Math.min(start + partSize, getStream.size);
-    const buf = await streamToBuffer(getStream.stream, start, end);
-    log(`uploading part ${n}/${totalParts} (${(buf.length / 1e6).toFixed(2)} MB)`);
-    const put = await fetch(url, { method: "PUT", body: buf });
-    if (!put.ok) {
-      throw new Error(`PUT part ${n} failed: ${put.status} ${await put.text()}`);
-    }
-    const etag = put.headers.get("etag") || put.headers.get("ETag");
-    completed.push({ partNumber: n, etag });
-  }
-  return completed;
+  const { buf, text } = await readResponseBody(r);
+  if (!r.ok) throw new Error(`api ${path} ${r.status}: ${text}`);
+  return buf.length ? JSON.parse(text) : {};
 }
 
 async function main() {
-  const input = process.argv[2];
-  if (!input) {
-    console.error("usage: node upload.mjs <file-path-or-url> [filename] [content-type]");
+  const [, , sourceArg, filenameArg, contentTypeArg] = process.argv;
+  if (!sourceArg) {
+    console.error("usage: node upload.mjs <file-or-url> [filename] [content-type]");
     process.exit(2);
   }
-  const overrideName = process.argv[3];
-  const overrideType = process.argv[4];
 
-  const isUrl = /^https?:\/\//i.test(input);
-  const src = isUrl ? await fetchRemote(input) : localSource(input);
-  const filename = overrideName || src.filename;
-  const contentType = overrideType || "application/octet-stream";
-  const size = src.size || 0;
+  let buffer, filename, contentType, size;
 
-  log("init: filename=", filename, "size=", size, "type=", contentType);
-  const init = await api("/upload/init", { filename, content_type: contentType, size });
-
-  let r2Key, confirmBody;
-  if (init.type === "single") {
-    log("single PUT to R2, size=", size);
-    const buf = await streamToBuffer(src.stream);
-    const put = await fetch(init.upload_url, { method: "PUT", body: buf });
-    if (!put.ok) throw new Error(`PUT failed: ${put.status} ${await put.text()}`);
-    r2Key = init.r2_key;
-    confirmBody = { filename, size, content_type: contentType, r2_key: r2Key };
+  if (/^https?:\/\//i.test(sourceArg)) {
+    const dl = await downloadToBuffer(sourceArg);
+    buffer = dl.buffer;
+    filename = filenameArg || dl.filename;
+    contentType = contentTypeArg || dl.contentType;
+    size = buffer.length;
   } else {
-    log(
-      "multipart: parts=",
-      init.total_parts,
-      "part_size=",
-      init.part_size,
-      "upload_id=",
-      init.upload_id
-    );
-    const completed = await putParts(
-      init.upload_id,
-      init.part_size,
-      init.total_parts,
-      init.initial_urls,
-      { stream: src.stream, size }
-    );
-    await api("/upload/complete-multipart", {
-      upload_id: init.upload_id,
-      parts: completed,
+    const local = readLocalFile(sourceArg);
+    filename = filenameArg || local.filename;
+    contentType = contentTypeArg || "application/octet-stream";
+    size = local.size;
+    buffer = await new Promise((resolve, reject) => {
+      const chunks = [];
+      local.stream.on("data", (c) => chunks.push(c));
+      local.stream.on("end", () => resolve(Buffer.concat(chunks)));
+      local.stream.on("error", reject);
     });
-    r2Key = init.r2_key;
-    confirmBody = { filename, size, content_type: contentType, r2_key: r2Key };
   }
 
-  log("confirming");
-  const conf = await api("/upload/confirm", confirmBody);
-  const out = {
-    url: conf.file.url,
-    raw_url: conf.file.raw_url,
-    id: conf.file.id,
-    filename: conf.file.filename,
-    size: conf.file.size,
-    expires_at: conf.file.expires_at,
-    owner_token: conf.owner_token,
-    visitor_token: VISITOR,
-  };
-  console.log("RESULT_JSON_BEGIN");
+  log(`init: filename=${filename} size=${size} type=${contentType}`);
+
+  const init = await api("/v3/file/init", {
+    filename,
+    size,
+    content_type: contentType,
+  });
+  log("init response:", JSON.stringify(init));
+
+  let publicUrl, rawUrl;
+
+  if (init.upload_type === "single" && init.upload_url) {
+    log(`single PUT to ${new URL(init.upload_url).host}, size=${size}`);
+    const r = await fetch(init.upload_url, {
+      method: "PUT",
+      headers: init.upload_headers || { "Content-Type": contentType },
+      body: buffer,
+    });
+    if (!r.ok) throw new Error(`upload PUT ${r.status}: ${await r.text().catch(() => "")}`);
+  } else if (init.upload_type === "multipart" && init.upload_id) {
+    log(`multipart upload, ${init.parts?.length || 0} parts`);
+    const partResults = [];
+    for (const part of init.parts) {
+      const start = part.partNumber * init.part_size;
+      const end = Math.min(start + init.part_size, size);
+      const chunk = buffer.subarray(start, end);
+      const r = await fetch(part.upload_url, {
+        method: "PUT",
+        headers: part.upload_headers || { "Content-Type": contentType },
+        body: chunk,
+      });
+      if (!r.ok) throw new Error(`part ${part.partNumber} upload ${r.status}: ${await r.text().catch(() => "")}`);
+      const etag = r.headers.get("etag") || r.headers.get("ETag");
+      partResults.push({ partNumber: part.partNumber, etag });
+    }
+    const finalize = await api("/v3/file/finalize", {
+      upload_id: init.upload_id,
+      parts: partResults,
+    });
+    log("finalize response:", JSON.stringify(finalize));
+  } else {
+    throw new Error("unexpected init response: " + JSON.stringify(init));
+  }
+
+  const done = await api("/v3/file/complete", {
+    file_id: init.file_id,
+  });
+  log("complete response:", JSON.stringify(done));
+
+  publicUrl = done.url || init.url;
+  rawUrl = done.raw_url || init.raw_url;
+
+  if (!publicUrl) throw new Error("no url in complete response");
+
+  const out = { url: publicUrl, raw_url: rawUrl, file_id: init.file_id, filename, size };
   console.log(JSON.stringify(out, null, 2));
-  console.log("RESULT_JSON_END");
+  emitResult(out);
 }
 
-main().catch((e) => {
-  console.error("ERROR:", e.message);
-  if (e.stack) console.error(e.stack);
+main().catch((err) => {
+  console.error("ERROR:", err.message);
+  if (err.stack) console.error(err.stack);
   process.exit(1);
 });
