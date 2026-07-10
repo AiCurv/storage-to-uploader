@@ -27,7 +27,7 @@ jobs:
     env:
       STORAGE_TO_VISITOR_TOKEN: ${{ secrets.STORAGE_TO_VISITOR_TOKEN }}
       VERCEL_CALLBACK_URL: ${{ secrets.VERCEL_CALLBACK_URL }}
-      VERIFY_TOKEN: ${{ secrets.VERIFY_TOKEN }}
+      VERIFY_TOKEN: ${{ secrets.BOT_VERIFY_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,6 +38,9 @@ jobs:
           node-version: "20"
 
       - name: Run upload
+        env:
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
         shell: bash
         run: |
           set -euo pipefail
@@ -45,17 +48,17 @@ jobs:
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             SOURCE="${{ github.event.client_payload.source_url }}"
             FILENAME="${{ github.event.client_payload.filename }}"
-            CHAT_ID="${{ github.event.client_payload.chat_id }}"
-            CALLBACK="${{ github.event.client_payload.callback_url }}"
+            CHAT_ID_VAL="${CHAT_ID:-}"
+            CALLBACK_VAL="${CALLBACK_URL:-}"
           else
             SOURCE="${{ inputs.source }}"
             FILENAME="${{ inputs.filename }}"
-            CHAT_ID=""
-            CALLBACK=""
+            CHAT_ID_VAL=""
+            CALLBACK_VAL=""
           fi
           echo "source=$SOURCE"
           echo "filename=$FILENAME"
-          echo "chat_id=$CHAT_ID"
+          echo "chat_id=$CHAT_ID_VAL"
 
           ARGS=( "$SOURCE" )
           [ -n "$FILENAME" ] && ARGS+=( "$FILENAME" )
@@ -65,11 +68,12 @@ jobs:
           STATUS=$?
           set -e
           if [ $STATUS -ne 0 ] || [ ! -s result.json ]; then
-            if [ -n "$CHAT_ID" ] && [ -n "$CALLBACK" ]; then
-              curl -fsS -X POST "$CALLBACK" \
+            if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
+              ERR_PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,error:"upload script failed (exit "+process.argv[1]+")"}))' "$STATUS")
+              curl -fsS -X POST "$CALLBACK_VAL" \
                 -H "Content-Type: application/json" \
                 -H "X-Verify: $VERIFY_TOKEN" \
-                -d "{\"chat_id\":\"$CHAT_ID\",\"error\":\"upload script failed (exit $STATUS)\"}" || true
+                -d "$ERR_PAYLOAD" || true
             fi
             exit $STATUS
           fi
@@ -81,10 +85,9 @@ jobs:
           echo "::notice title=storage.to link::$URL"
           echo "::notice title=raw link::$RAW"
 
-          if [ -n "$CHAT_ID" ] && [ -n "$CALLBACK" ]; then
-            PAYLOAD=$(node -e "console.log(JSON.stringify({chat_id:process.env.CHAT_ID,url:process.env.URL,raw_url:process.env.RAW,filename:process.env.FNAME,size_bytes:Number(process.env.SIZE)}))" )
-            CHAT_ID="$CHAT_ID" URL="$URL" RAW="$RAW" FNAME="$FNAME" SIZE="$SIZE" \
-            curl -fsS -X POST "$CALLBACK" \
+          if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
+            PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" URL="$URL" RAW="$RAW" FNAME="$FNAME" SIZE="$SIZE" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,url:process.env.URL,raw_url:process.env.RAW,filename:process.env.FNAME,size_bytes:Number(process.env.SIZE)}))')
+            curl -fsS -X POST "$CALLBACK_VAL" \
               -H "Content-Type: application/json" \
               -H "X-Verify: $VERIFY_TOKEN" \
               -d "$PAYLOAD" || true
