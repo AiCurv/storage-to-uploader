@@ -1,0 +1,63 @@
+name: Upload to storage.to
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "HTTP(S) URL or in-repo file path to upload"
+        required: true
+        type: string
+      filename:
+        description: "Override filename (optional)"
+        required: false
+        type: string
+        default: ""
+      content_type:
+        description: "Override content type (optional)"
+        required: false
+        type: string
+        default: "application/octet-stream"
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      STORAGE_TO_VISITOR_TOKEN: ${{ secrets.STORAGE_TO_VISITOR_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run upload
+        id: upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=( "${{ inputs.source }}" )
+          if [ -n "${{ inputs.filename }}" ]; then ARGS+=( "${{ inputs.filename }}" ); fi
+          if [ -n "${{ inputs.content_type }}" ] && [ "${{ inputs.content_type }}" != "application/octet-stream" ]; then
+            ARGS+=( "${{ inputs.content_type }}" )
+          fi
+          # Capture RESULT_JSON block
+          OUT=$(node upload.mjs "${ARGS[@]}" 2>&1 | tee /dev/stderr)
+          JSON=$(echo "$OUT" | sed -n '/RESULT_JSON_BEGIN/,/RESULT_JSON_END/p' | sed '1d;$d')
+          echo "$JSON" > result.json
+          URL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).url)")
+          RAW=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).raw_url)")
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "raw_url=$RAW" >> "$GITHUB_OUTPUT"
+          echo "::notice title=storage.to upload::Public link: $URL"
+
+      - name: Persist result
+        if: always()
+        run: |
+          if [ -f result.json ]; then
+            echo "result.json (truncated):"
+            head -c 800 result.json
+            echo
+          fi
