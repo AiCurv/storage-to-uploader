@@ -33,6 +33,7 @@ const WELCOME = [
   "/subson — Enable subtitle extraction",
   "/subsoff — Disable subtitle extraction",
   "/status — Recent upload status",
+  "/channelid — Get channel ID for auto-posting",
   "/help — Detailed help",
   "",
   "💡 Works with pixeldrain, direct links, and most file hosts!",
@@ -190,7 +191,22 @@ export default async function handler(req, res) {
   }
 
   const message = update.message || update.edited_message;
-  if (!message) return res.status(200).json({ ok: true, ignored: true });
+  if (!message) {
+    // Handle my_chat_member updates (bot added to channel/group)
+    if (update.my_chat_member) {
+      const chat = update.my_chat_member.chat;
+      if (chat.type === "channel" || chat.type === "supergroup") {
+        // Auto-detect channel ID and notify user
+        const channelInfo = `📢 Bot added to <b>${chat.title || "channel"}</b>\nChannel ID: <code>${chat.id}</code>\n\nAdd this as TELEGRAM_CHANNEL_ID secret in GitHub to enable auto-posting!`;
+        // Try to notify the allowed user
+        const allowedId = String(process.env.TELEGRAM_ALLOWED_ID || "");
+        if (allowedId) {
+          await sendMessage(allowedId, channelInfo);
+        }
+      }
+    }
+    return res.status(200).json({ ok: true, ignored: "non-message" });
+  }
 
   const chatId = message.chat.id;
   const allowed = String(process.env.TELEGRAM_ALLOWED_ID || "");
@@ -233,13 +249,26 @@ export default async function handler(req, res) {
   if (text === "/status" || text === "/status@Streamtobufferbot") {
     const settings = getUserSettings(chatId);
     const subsStatus = settings.extractSubs ? "✅ ON" : "❌ OFF";
+    const channelStatus = CHANNEL_ID ? `✅ Auto-posting to channel` : "❌ No channel configured";
     await sendMessage(chatId, 
       `📊 <b>Current Settings</b>\n\n` +
       `Subtitle extraction: ${subsStatus}\n` +
       `MP4 conversion: ✅ ON (default)\n` +
-      `Channel posting: ✅ Auto\n\n` +
+      `Channel: ${channelStatus}\n\n` +
       `💡 Send a URL to upload!`,
       mainMenu());
+    return res.status(200).json({ ok: true });
+  }
+
+  // ─── Command: /channelid ───
+  if (text === "/channelid" || text === "/channelid@Streamtobufferbot") {
+    // If used in a channel, shows the channel ID
+    const chatType = message.chat.type;
+    if (chatType === "channel" || chatType === "supergroup") {
+      await sendMessage(chatId, `📢 This ${chatType}'s ID: <code>${chatId}</code>\n\nSet this as TELEGRAM_CHANNEL_ID in GitHub secrets to enable auto-posting!`);
+    } else {
+      await sendMessage(chatId, `📋 Your chat ID: <code>${chatId}</code>\n\nUse this command in a channel to get the channel ID. Or add the bot to your channel and it will auto-detect the ID.`);
+    }
     return res.status(200).json({ ok: true });
   }
 

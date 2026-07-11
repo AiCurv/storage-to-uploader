@@ -33,6 +33,7 @@ export default async function handler(req, res) {
     { command: "subson", description: "Enable subtitle extraction" },
     { command: "subsoff", description: "Disable subtitle extraction" },
     { command: "status", description: "Check current settings" },
+    { command: "channelid", description: "Get channel ID for auto-posting" },
     { command: "help", description: "Detailed help & info" },
   ];
   const cmdRes = await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
