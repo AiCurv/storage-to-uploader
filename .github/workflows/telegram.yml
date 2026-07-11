@@ -23,11 +23,15 @@ on:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       STORAGE_TO_VISITOR_TOKEN: ${{ secrets.STORAGE_TO_VISITOR_TOKEN }}
       VERCEL_CALLBACK_URL: ${{ secrets.VERCEL_CALLBACK_URL }}
       VERIFY_TOKEN: ${{ secrets.BOT_VERIFY_TOKEN }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+      CONVERT_TO_MP4: "1"
+      EXTRACT_SUBS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,6 +41,12 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
+
       - name: Run upload
         env:
           EVENT_PAYLOAD: ${{ toJSON(github.event) }}
@@ -44,16 +54,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Dump full event to debug file
           echo "$EVENT_PAYLOAD" > /tmp/event.json
           echo "::notice title=event dump::$(head -c 400 /tmp/event.json)"
 
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            # Read client_payload from the saved file using node (handles JSON safely)
             SOURCE=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.source_url||"")}catch(_){process.stdout.write("")}')
             FILENAME=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.filename||"")}catch(_){process.stdout.write("")}')
             CHAT_ID_VAL=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.chat_id?String(p.chat_id):"")}catch(_){process.stdout.write("")}')
+            # Read user settings from payload
+            DO_CONVERT=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.convert_to_mp4||"1")}catch(_){process.stdout.write("1")}')
+            DO_EXTRACT=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.extract_subs||"1")}catch(_){process.stdout.write("1")}')
             CALLBACK_VAL="$VERCEL_CALLBACK_URL"
+            export CONVERT_TO_MP4="$DO_CONVERT"
+            export EXTRACT_SUBS="$DO_EXTRACT"
           else
             SOURCE="${{ inputs.source }}"
             FILENAME="${{ inputs.filename }}"
@@ -85,7 +98,6 @@ jobs:
           STATUS=$?
           set -e
 
-          # Parse the RESULT_JSON block from stdout
           JSON=$(echo "$OUT" | sed -n '/RESULT_JSON_BEGIN/,/RESULT_JSON_END/p' | sed '1d;$d')
           if [ $STATUS -ne 0 ] || [ -z "$JSON" ]; then
             echo "::error::upload script failed (exit $STATUS)"
@@ -100,17 +112,41 @@ jobs:
           fi
 
           echo "$JSON" > result.json
-          URL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).url||'')")
-          RAW=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).raw_url||'')")
-          SIZE=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).size||0)")
-          FNAME=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).filename||'')")
-          echo "::notice title=storage.to link::$URL"
-          echo "::notice title=raw link::$RAW"
 
+          # Parse the new nested result format
+          MAIN_URL=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.url||'')")
+          MAIN_RAW=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.raw_url||'')")
+          MAIN_FNAME=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.filename||'')")
+          MAIN_SIZE=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(String(r.main?.size||0))")
+          MAIN_HSIZE=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.human_size||'')")
+          SUBS_JSON=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(JSON.stringify(r.subtitles||[]))")
+
+          echo "::notice title=storage.to link::$MAIN_URL"
+          echo "::notice title=raw link::$MAIN_RAW"
+          echo "::notice title=subtitles::$SUBS_JSON"
+
+          # Callback to Vercel bot with results
           if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
-            PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" URL="$URL" RAW="$RAW" FNAME="$FNAME" SIZE="$SIZE" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,url:process.env.URL,raw_url:process.env.RAW,filename:process.env.FNAME,size_bytes:Number(process.env.SIZE)}))')
+            PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" URL="$MAIN_URL" RAW="$MAIN_RAW" FNAME="$MAIN_FNAME" SIZE="$MAIN_SIZE" HSIZE="$MAIN_HSIZE" SUBS="$SUBS_JSON" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,url:process.env.URL,raw_url:process.env.RAW,filename:process.env.FNAME,size_bytes:Number(process.env.SIZE),human_size:process.env.HSIZE,subtitles:JSON.parse(process.env.SUBS)}))')
             curl -fsS -X POST "$CALLBACK_VAL" \
               -H "Content-Type: application/json" \
               -H "X-Verify: $VERIFY_TOKEN" \
               -d "$PAYLOAD" || true
+          fi
+
+          # Also post to the channel if TELEGRAM_CHANNEL_ID is set
+          if [ -n "$TELEGRAM_CHANNEL_ID" ] && [ -n "$MAIN_URL" ]; then
+            CHANNEL_MSG=$(URL="$MAIN_URL" RAW="$MAIN_RAW" FNAME="$MAIN_FNAME" HSIZE="$MAIN_HSIZE" SUBS="$SUBS_JSON" node -e '
+              const u=process.env.URL, r=process.env.RAW, f=process.env.FNAME, h=process.env.HSIZE;
+              const subs = JSON.parse(process.env.SUBS||"[]");
+              let msg = `🎬 ${f} (${h})\n\n🔗 Stream: ${u}\n📦 Direct: ${r}`;
+              if (subs.length > 0) {
+                msg += "\n\n📝 Subtitles:";
+                subs.forEach(s => { msg += `\n  • ${s.filename}: ${s.url}`; });
+              }
+              process.stdout.write(msg);
+            ')
+            curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${TELEGRAM_CHANNEL_ID}\",\"text\":$(echo "$CHANNEL_MSG" | node -e 'process.stdout.write(JSON.stringify(require("fs").readFileSync(0,"utf8")))'),\"parse_mode\":\"HTML\",\"disable_web_page_preview\":false}" || true
           fi

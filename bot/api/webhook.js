@@ -1,68 +1,129 @@
 // Telegram webhook entrypoint. Vercel invokes this on every incoming message.
-// Security: hard-locks the bot to one Telegram user id, so even if the token
-// leaks, only the owner can use the bot.
 //
-// Flow:
-//   1. Receive update from Telegram.
-//   2. Verify sender == TELEGRAM_ALLOWED_ID; ignore everyone else.
-//   3. /start  -> send welcome + inline menu (/start, /idk).
-//   4. /idk    -> send help message.
-//   5. text URL -> kick off the GitHub Actions uploader, send "uploading..." reply.
-//      The workflow later POSTs the result back to /api/result, which then
-//      forwards the storage.to link to the user via sendMessage.
+// Commands:
+//   /start        - Welcome message + main menu
+//   /upload <url> - Upload a file URL to storage.to (converts video to MP4)
+//   /status       - Check your recent uploads
+//   /help         - Detailed help message
+//   /raw <url>    - Upload without MP4 conversion (raw passthrough)
+//   /subson       - Enable subtitle extraction (default: ON)
+//   /subsoff      - Disable subtitle extraction
+//
+// Any direct URL sent as text auto-triggers upload with conversion.
+//
+// Security: hard-locks the bot to one Telegram user id.
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
+const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID || "";
 
 const WELCOME = [
-  "Hey! Send me any direct download URL and I'll upload it to storage.to.",
+  "🎬 <b>StreamToBuffer Bot</b>",
   "",
-  "Commands:",
-  "/start - show the main menu",
-  "/idk   - same as /start, alias",
+  "Send me any download link and I'll:",
+  "  1️⃣ Download the file",
+  "  2️⃣ Convert video to streamable MP4",
+  "  3️⃣ Extract subtitles (if any)",
+  "  4️⃣ Upload to storage.to",
+  "  5️⃣ Post to the channel",
+  "  6️⃣ Send you the links",
   "",
-  "Tip: works best with raw file links (mp4, mkv, mov, zip, etc).",
+  "📝 <b>Commands:</b>",
+  "/upload &lt;url&gt; — Upload & convert to MP4",
+  "/raw &lt;url&gt; — Upload without conversion",
+  "/subson — Enable subtitle extraction",
+  "/subsoff — Disable subtitle extraction",
+  "/status — Recent upload status",
+  "/help — Detailed help",
+  "",
+  "💡 Works with pixeldrain, direct links, and most file hosts!",
 ].join("\n");
+
+const HELP_MSG = [
+  "📖 <b>StreamToBuffer Help</b>",
+  "",
+  "<b>How it works:</b>",
+  "You send a download URL → I download it via GitHub Actions → FFmpeg converts video to streamable MP4 → subtitles are extracted → everything uploads to storage.to → you get MP4 + subtitle links → posted to channel.",
+  "",
+  "<b>Supported sources:</b>",
+  "• Pixeldrain (/u/, /d/, /api/file/ links all work)",
+  "• Direct download links (mp4, mkv, avi, etc.)",
+  "• Any URL that serves file bytes",
+  "",
+  "<b>Video conversion:</b>",
+  "• Auto-converts MKV/AVI/MOV/WebM/etc → MP4",
+  "• Uses H.264 + AAC for universal compatibility",
+  "• Adds faststart for instant streaming",
+  "• Already-MP4 files: just ensures faststart",
+  "",
+  "<b>Subtitles:</b>",
+  "• Auto-extracts SRT/ASS/VTT from video files",
+  "• Each subtitle uploaded as separate file",
+  "• Toggle with /subson and /subsoff",
+  "",
+  "<b>Links you get:</b>",
+  "• 🔗 HTML page (with player + QR code)",
+  "• 📦 Raw direct link (streamable MP4)",
+  "• 📝 Subtitle links (if found)",
+  "",
+  "<b>Channel auto-post:</b>",
+  "Every upload is automatically posted to @AiCurv channel.",
+].join("\n");
+
+// Per-user settings (in-memory, resets on redeploy — good enough for single-user bot)
+const userSettings = {};
+
+function getUserSettings(chatId) {
+  const key = String(chatId);
+  if (!userSettings[key]) {
+    userSettings[key] = { extractSubs: true };
+  }
+  return userSettings[key];
+}
 
 async function sendMessage(chatId, text, extra = {}) {
   await fetch(`${TELEGRAM_API}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra }),
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      ...extra,
+    }),
   });
 }
 
 function mainMenu() {
   return {
     reply_markup: {
-      keyboard: [[{ text: "/start" }, { text: "/idk" }]],
+      keyboard: [
+        [{ text: "🎬 Upload link" }, { text: "/status" }],
+        [{ text: "/subson" }, { text: "/subsoff" }],
+        [{ text: "/help" }],
+      ],
       resize_keyboard: true,
       is_persistent: true,
     },
   };
 }
 
-// Convert known "share page" URLs into the underlying direct-download URL.
-// The upload.mjs script has its own resolveSource() which further normalizes
-// pixeldrain URLs (adding ?download and browser UA). Here we just make sure
-// the URL points at a file endpoint, not a viewer page.
+// Convert known "share page" URLs into direct download URLs.
 function normalizeSourceUrl(text) {
   let url;
   try { url = new URL(text.trim()); } catch { return null; }
   const host = url.host.toLowerCase();
   const path = url.pathname;
 
-  // pixeldrain: /u/<id> is an HTML viewer. /api/file/<id> serves the bytes.
-  // We rewrite /u/<id> → /api/file/<id> so upload.mjs gets a file endpoint.
-  // upload.mjs will add ?download + browser UA automatically.
   if (host === "pixeldrain.com" || host.endsWith(".pixeldrain.com")) {
-    const m = path.match(/^\/u\/([A-Za-z0-9]+)/);
-    if (m) return `https://pixeldrain.com/api/file/${m[1]}`;
-    // /d/<id> is also a viewer; rewrite to /api/file/<id>
+    // /u/<id> and /d/<id> are HTML viewers → rewrite to /api/file/<id>
+    const m1 = path.match(/^\/u\/([A-Za-z0-9]+)/);
+    if (m1) return `https://pixeldrain.com/api/file/${m1[1]}`;
     const m2 = path.match(/^\/d\/([A-Za-z0-9]+)/);
     if (m2) return `https://pixeldrain.com/api/file/${m2[1]}`;
   }
 
-  return null; // no rewrite - pass through to the workflow
+  return null; // no rewrite needed
 }
 
 function looksLikeUrl(text) {
@@ -79,9 +140,22 @@ function filenameFromUrl(url) {
   }
 }
 
-async function triggerUpload(sourceUrl, originalName, chatId) {
+async function triggerUpload(sourceUrl, originalName, chatId, options = {}) {
   const repo = process.env.GITHUB_REPO || "AiCurv/storage-to-uploader";
   const [owner, name] = repo.split("/");
+  const settings = getUserSettings(chatId);
+
+  const payload = {
+    event_type: "telegram-upload",
+    client_payload: {
+      source_url: sourceUrl,
+      filename: originalName,
+      chat_id: String(chatId),
+      convert_to_mp4: options.rawMode ? "0" : "1",
+      extract_subs: settings.extractSubs ? "1" : "0",
+    },
+  };
+
   const res = await fetch(`https://api.github.com/repos/${owner}/${name}/dispatches`, {
     method: "POST",
     headers: {
@@ -90,15 +164,7 @@ async function triggerUpload(sourceUrl, originalName, chatId) {
       "Content-Type": "application/json",
       "X-GitHub-Api-Version": "2022-11-28",
     },
-    body: JSON.stringify({
-      event_type: "telegram-upload",
-      client_payload: {
-        source_url: sourceUrl,
-        filename: originalName,
-        chat_id: String(chatId),
-        callback_url: `https://${process.env.VERCEL_PROJECT_URL}/api/result`,
-      },
-    }),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -106,8 +172,13 @@ async function triggerUpload(sourceUrl, originalName, chatId) {
   }
 }
 
+function extractUrlFromText(text) {
+  // Find URLs in text (could be mixed with other text)
+  const m = text.match(/https?:\/\/\S+/i);
+  return m ? m[0] : null;
+}
+
 export default async function handler(req, res) {
-  // Telegram uses POST for webhooks; allow GET for warmup.
   if (req.method === "GET") return res.status(200).json({ ok: true, webhook: "ready" });
   if (req.method !== "POST") return res.status(405).end();
 
@@ -124,43 +195,117 @@ export default async function handler(req, res) {
   const chatId = message.chat.id;
   const allowed = String(process.env.TELEGRAM_ALLOWED_ID || "");
   if (allowed && String(chatId) !== allowed) {
-    // Silently drop - never reveal the bot exists to anyone else.
     return res.status(200).json({ ok: true, ignored: "unauthorized" });
   }
 
   const text = (message.text || "").trim();
   if (!text) return res.status(200).json({ ok: true, ignored: "empty" });
 
-  // Commands
-  if (text === "/start" || text === "/idk") {
+  // ─── Command: /start ───
+  if (text === "/start" || text === "/start@Streamtobufferbot") {
     await sendMessage(chatId, WELCOME, mainMenu());
     return res.status(200).json({ ok: true });
   }
 
-  // Anything starting with / is rejected so we don't echo random bot commands.
+  // ─── Command: /help ───
+  if (text === "/help" || text === "/help@Streamtobufferbot" || text === "/idk") {
+    await sendMessage(chatId, HELP_MSG, mainMenu());
+    return res.status(200).json({ ok: true });
+  }
+
+  // ─── Command: /subson ───
+  if (text === "/subson" || text === "/subson@Streamtobufferbot") {
+    const settings = getUserSettings(chatId);
+    settings.extractSubs = true;
+    await sendMessage(chatId, "✅ Subtitle extraction <b>enabled</b>. Subtitles will be extracted from video files and uploaded.", mainMenu());
+    return res.status(200).json({ ok: true });
+  }
+
+  // ─── Command: /subsoff ───
+  if (text === "/subsoff" || text === "/subsoff@Streamtobufferbot") {
+    const settings = getUserSettings(chatId);
+    settings.extractSubs = false;
+    await sendMessage(chatId, "❌ Subtitle extraction <b>disabled</b>. No subtitles will be extracted.", mainMenu());
+    return res.status(200).json({ ok: true });
+  }
+
+  // ─── Command: /status ───
+  if (text === "/status" || text === "/status@Streamtobufferbot") {
+    const settings = getUserSettings(chatId);
+    const subsStatus = settings.extractSubs ? "✅ ON" : "❌ OFF";
+    await sendMessage(chatId, 
+      `📊 <b>Current Settings</b>\n\n` +
+      `Subtitle extraction: ${subsStatus}\n` +
+      `MP4 conversion: ✅ ON (default)\n` +
+      `Channel posting: ✅ Auto\n\n` +
+      `💡 Send a URL to upload!`,
+      mainMenu());
+    return res.status(200).json({ ok: true });
+  }
+
+  // ─── Command: /upload <url> ───
+  if (text.startsWith("/upload ") || text.startsWith("/upload@Streamtobufferbot ")) {
+    const urlPart = text.replace(/^\/upload(@\w+)?\s+/, "").trim();
+    if (!looksLikeUrl(urlPart)) {
+      await sendMessage(chatId, "❌ Please provide a valid URL after /upload\nExample: <code>/upload https://example.com/video.mkv</code>", mainMenu());
+      return res.status(200).json({ ok: true });
+    }
+    const sourceUrl = normalizeSourceUrl(urlPart) || urlPart;
+    const filename = filenameFromUrl(sourceUrl);
+    try {
+      await triggerUpload(sourceUrl, filename, chatId);
+      await sendMessage(chatId, `⏬ Queued <code>${filename}</code>\n🔄 Converting to MP4 & uploading...\nI'll message you when done!`, mainMenu());
+    } catch (err) {
+      await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
+    }
+    return res.status(200).json({ ok: true });
+  }
+
+  // ─── Command: /raw <url> ───
+  if (text.startsWith("/raw ") || text.startsWith("/raw@Streamtobufferbot ")) {
+    const urlPart = text.replace(/^\/raw(@\w+)?\s+/, "").trim();
+    if (!looksLikeUrl(urlPart)) {
+      await sendMessage(chatId, "❌ Please provide a valid URL after /raw\nExample: <code>/raw https://example.com/file.zip</code>", mainMenu());
+      return res.status(200).json({ ok: true });
+    }
+    const sourceUrl = normalizeSourceUrl(urlPart) || urlPart;
+    const filename = filenameFromUrl(sourceUrl);
+    try {
+      await triggerUpload(sourceUrl, filename, chatId, { rawMode: true });
+      await sendMessage(chatId, `⏬ Queued <code>${filename}</code> (raw mode - no conversion)\n🔄 Uploading...\nI'll message you when done!`, mainMenu());
+    } catch (err) {
+      await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
+    }
+    return res.status(200).json({ ok: true });
+  }
+
+  // ─── Menu button: "🎬 Upload link" ───
+  if (text === "🎬 Upload link") {
+    await sendMessage(chatId, "📎 Paste your download link below, or use:\n<code>/upload URL</code> — convert to MP4\n<code>/raw URL</code> — no conversion", mainMenu());
+    return res.status(200).json({ ok: true });
+  }
+
+  // ─── Unknown commands ───
   if (text.startsWith("/")) {
-    await sendMessage(chatId, "Unknown command. Try /start.", mainMenu());
+    await sendMessage(chatId, "❓ Unknown command. Try /help for available commands.", mainMenu());
     return res.status(200).json({ ok: true });
   }
 
-  // URL handling
-  if (!looksLikeUrl(text)) {
-    await sendMessage(
-      chatId,
-      "Send a direct file URL (http(s)://...). I download and upload it to storage.to.",
-      mainMenu(),
-    );
+  // ─── Auto-detect URL in message ───
+  const detectedUrl = extractUrlFromText(text);
+  if (detectedUrl) {
+    const sourceUrl = normalizeSourceUrl(detectedUrl) || detectedUrl;
+    const filename = filenameFromUrl(sourceUrl);
+    try {
+      await triggerUpload(sourceUrl, filename, chatId);
+      await sendMessage(chatId, `⏬ Queued <code>${filename}</code>\n🔄 Converting to MP4 & uploading...\nI'll message you when done!`, mainMenu());
+    } catch (err) {
+      await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
+    }
     return res.status(200).json({ ok: true });
   }
 
-  // Translate known share-page URLs (e.g. pixeldrain) to their direct links.
-  const sourceUrl = normalizeSourceUrl(text) || text;
-  const filename = filenameFromUrl(sourceUrl);
-  try {
-    await triggerUpload(sourceUrl, filename, chatId);
-    await sendMessage(chatId, `⏬ Queued <code>${filename}</code>\nUploading... I'll message you when it's done.`, mainMenu());
-  } catch (err) {
-    await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
-  }
+  // ─── Non-URL text ───
+  await sendMessage(chatId, "📎 Send a direct file URL (http(s)://...) and I'll download, convert, and upload it to storage.to.\n\nType /help for more info.", mainMenu());
   return res.status(200).json({ ok: true });
 }

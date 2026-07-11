@@ -21,9 +21,11 @@ on:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       STORAGE_TO_VISITOR_TOKEN: ${{ secrets.STORAGE_TO_VISITOR_TOKEN }}
+      CONVERT_TO_MP4: "1"
+      EXTRACT_SUBS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,6 +34,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
 
       - name: Run upload
         id: upload
@@ -43,21 +51,23 @@ jobs:
           if [ -n "${{ inputs.content_type }}" ] && [ "${{ inputs.content_type }}" != "application/octet-stream" ]; then
             ARGS+=( "${{ inputs.content_type }}" )
           fi
-          # Capture RESULT_JSON block
           OUT=$(node upload.mjs "${ARGS[@]}" 2>&1 | tee /dev/stderr)
           JSON=$(echo "$OUT" | sed -n '/RESULT_JSON_BEGIN/,/RESULT_JSON_END/p' | sed '1d;$d')
           echo "$JSON" > result.json
-          URL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).url)")
-          RAW=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).raw_url)")
+          URL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).main?.url||'')")
+          RAW=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).main?.raw_url||'')")
+          SUBS=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));console.log(JSON.stringify(r.subtitles||[]))")
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "raw_url=$RAW" >> "$GITHUB_OUTPUT"
+          echo "subtitles=$SUBS" >> "$GITHUB_OUTPUT"
           echo "::notice title=storage.to upload::Public link: $URL"
+          echo "::notice title=subtitles::$SUBS"
 
       - name: Persist result
         if: always()
         run: |
           if [ -f result.json ]; then
             echo "result.json (truncated):"
-            head -c 800 result.json
+            head -c 1200 result.json
             echo
           fi
