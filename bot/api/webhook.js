@@ -86,7 +86,7 @@ async function triggerUpload(sourceUrl, originalName, chatId) {
     method: "POST",
     headers: {
       Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      Authorization: `Bearer ${process.env.GH_TOKEN || process.env.GITHUB_TOKEN}`,
       "Content-Type": "application/json",
       "X-GitHub-Api-Version": "2022-11-28",
     },
