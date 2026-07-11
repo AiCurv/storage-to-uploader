@@ -1,5 +1,5 @@
 // Called by the GitHub Actions workflow when an upload finishes.
-// Body: { chat_id, url, raw_url, filename, size_bytes, human_size, subtitles, ok, error }
+// Body: { chat_id, url, raw_url, streaming_url, filename, size_bytes, human_size, subtitles, video_info, thumbnail, converted, ok, error }
 // We forward the result to the user via sendMessage and post to channel.
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
@@ -27,16 +27,40 @@ function humanSize(n) {
   return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
 }
 
+function formatDuration(seconds) {
+  if (!seconds) return "?";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
 function buildResultMessage(body) {
   const size = body.human_size || humanSize(body.size_bytes);
   const lines = [
     `✅ <b>Upload Complete!</b>`,
     ``,
     `🎬 <b>${body.filename}</b> (${size})`,
-    ``,
-    `🔗 <a href="${body.url}">Stream / Download Page</a>`,
-    `📦 <a href="${body.raw_url}">Direct MP4 Link</a>`,
   ];
+
+  // Show video info if available
+  if (body.video_info) {
+    const vi = body.video_info;
+    lines.push(`📐 ${vi.video_resolution || "?"} | ${vi.video_codec || "?"} | ${formatDuration(vi.duration)}`);
+    if (body.converted) {
+      lines.push(`🔄 Converted to MP4`);
+    }
+  }
+
+  lines.push("");
+  lines.push(`🔗 <a href="${body.url}">HTML Page</a> (stream + download + QR)`);
+
+  // Streaming CDN link — THIS is the link that plays in browser/VLC
+  if (body.streaming_url) {
+    lines.push(`▶️ <a href="${body.streaming_url}">Stream Direct</a> (play in browser/VLC)`);
+  }
 
   // Add subtitle links if present
   const subs = body.subtitles || [];
@@ -55,6 +79,10 @@ function buildResultMessage(body) {
     lines.push(`⏰ Links expire: ${body.expires_at}`);
   }
 
+  // Tip
+  lines.push("");
+  lines.push(`💡 Tip: "Stream Direct" link plays instantly. "HTML Page" has the full player + download button.`);
+
   return lines.join("\n");
 }
 
@@ -63,7 +91,7 @@ function buildChannelMessage(body) {
   const lines = [
     `🎬 <b>${body.filename}</b> (${size})`,
     ``,
-    `🔗 <a href="${body.url}">Stream</a> | <a href="${body.raw_url}">Download</a>`,
+    `🔗 <a href="${body.url}">Stream</a> | <a href="${body.streaming_url || body.raw_url}">Direct</a>`,
   ];
 
   const subs = body.subtitles || [];
@@ -104,7 +132,7 @@ export default async function handler(req, res) {
   const userMsg = buildResultMessage(body);
   await sendMessage(chatId, userMsg);
 
-  // Post to channel if configured
+  // Post to channel if configured (just a link message — the actual video upload happens from GitHub Actions)
   if (CHANNEL_ID) {
     try {
       const channelMsg = buildChannelMessage(body);

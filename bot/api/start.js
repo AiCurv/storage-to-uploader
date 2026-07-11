@@ -21,7 +21,7 @@ export default async function handler(req, res) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       url: webhookUrl,
-      allowed_updates: ["message", "channel_post"],
+      allowed_updates: ["message", "channel_post", "my_chat_member"],
     }),
   });
   results.webhook = { url: webhookUrl, telegram: await wh.json() };
@@ -30,10 +30,14 @@ export default async function handler(req, res) {
   const commands = [
     { command: "upload", description: "Upload & convert video to MP4" },
     { command: "raw", description: "Upload without conversion" },
+    { command: "info", description: "Get video info without uploading" },
+    { command: "rename", description: "Set custom filename for next upload" },
     { command: "subson", description: "Enable subtitle extraction" },
     { command: "subsoff", description: "Disable subtitle extraction" },
     { command: "status", description: "Check current settings" },
     { command: "channelid", description: "Get channel ID for auto-posting" },
+    { command: "ping", description: "Check bot latency" },
+    { command: "about", description: "About this bot" },
     { command: "help", description: "Detailed help & info" },
   ];
   const cmdRes = await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
@@ -48,7 +52,15 @@ export default async function handler(req, res) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      description: "🎬 Send me any video link and I'll convert it to streamable MP4, extract subtitles, and upload to storage.to!\n\nSupports: MKV, AVI, MOV, WebM, and more → MP4",
+      description:
+        "🎬 StreamToBuffer Bot v2.0 — Send me any video link and I'll convert it to streamable MP4, extract subtitles, and upload to storage.to!\n\n" +
+        "✨ Features:\n" +
+        "• MKV/AVI/MOV/WebM → MP4 conversion\n" +
+        "• Subtitle extraction (SRT/ASS/VTT)\n" +
+        "• Streaming CDN link + HTML page\n" +
+        "• Auto-post to your channel\n" +
+        "• Supports files up to 5GB+\n\n" +
+        "Just send a URL to get started!",
     }),
   });
 
@@ -57,7 +69,16 @@ export default async function handler(req, res) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      short_description: "Video to MP4 converter & uploader",
+      short_description: "Video → MP4 converter & uploader with streaming links",
+    }),
+  });
+
+  // 5. Set menu button (opens command list)
+  await fetch(`https://api.telegram.org/bot${token}/setChatMenuButton`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      menu_button: { type: "commands" },
     }),
   });
 
