@@ -81,10 +81,14 @@ jobs:
           [ -n "$FILENAME" ] && ARGS+=( "$FILENAME" )
 
           set +e
-          node upload.mjs "${ARGS[@]}"
+          OUT=$(node upload.mjs "${ARGS[@]}" 2>&1 | tee /dev/stderr)
           STATUS=$?
           set -e
-          if [ $STATUS -ne 0 ] || [ ! -s result.json ]; then
+
+          # Parse the RESULT_JSON block from stdout
+          JSON=$(echo "$OUT" | sed -n '/RESULT_JSON_BEGIN/,/RESULT_JSON_END/p' | sed '1d;$d')
+          if [ $STATUS -ne 0 ] || [ -z "$JSON" ]; then
+            echo "::error::upload script failed (exit $STATUS)"
             if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
               ERR_PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,error:"upload script failed (exit "+process.argv[1]+")"}))' "$STATUS")
               curl -fsS -X POST "$CALLBACK_VAL" \
@@ -95,6 +99,7 @@ jobs:
             exit $STATUS
           fi
 
+          echo "$JSON" > result.json
           URL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).url||'')")
           RAW=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).raw_url||'')")
           SIZE=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).size||0)")

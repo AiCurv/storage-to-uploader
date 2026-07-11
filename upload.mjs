@@ -52,15 +52,16 @@ function resolveSource(rawUrl) {
   const u = new URL(rawUrl);
   const host = u.hostname.toLowerCase();
 
-  // Pixeldrain: /api/file/<id> 403s without a browser UA, and
-  // /api/file/ serves a "Click here to download" HTML wrapper.
-  // The real bytes are at /api/file/<id>?download - but the cleanest
-  // direct path is /u/<id> which streams the file with a 200 + UA.
+  // Pixeldrain: the /u/<id> endpoint serves an HTML viewer page, NOT the file.
+  // The /api/file/<id> endpoint returns the actual file bytes when a browser
+  // UA is provided. We always rewrite to /api/file/<id>?download and attach
+  // a browser User-Agent so pixeldrain doesn't 403 or serve HTML.
   if (host === "pixeldrain.com" || host === "www.pixeldrain.com") {
-    const m = u.pathname.match(/^\/(?:api\/file|d)\/([A-Za-z0-9]+)/);
+    // Match /u/<id>, /api/file/<id>, /d/<id>
+    const m = u.pathname.match(/^\/(?:u|api\/file|d)\/([A-Za-z0-9]+)/);
     if (m) {
-      const fixed = new URL(`/u/${m[1]}${u.search}`, u);
-      return { url: fixed.toString(), headers: {} };
+      const fixed = new URL(`/api/file/${m[1]}?download`, u);
+      return { url: fixed.toString(), headers: { "User-Agent": UA } };
     }
   }
 
@@ -74,10 +75,16 @@ async function getSource(src) {
     log("downloading source:", url);
     const r = await fetch(url, { redirect: "follow", headers });
     if (!r.ok) throw new Error(`source fetch ${r.status} ${url}`);
-    const sizeHeader = r.headers.get("content-length");
+    const contentType = r.headers.get("content-type") || "application/octet-stream";
+    // Detect if we got HTML instead of a file — common when a host redirects
+    // to a share page instead of serving the raw bytes.
+    if (contentType.startsWith("text/html") && !src.endsWith(".html") && !src.endsWith(".htm")) {
+      throw new Error(`source returned HTML (content-type: ${contentType}), not a file. ` +
+        `The URL may be a share-page link rather than a direct download link.`);
+    }
     const buf = Buffer.from(await r.arrayBuffer());
     const filename = guessFilename(src, r.headers.get("content-disposition"));
-    return { buffer: buf, size: buf.length, filename, contentType: r.headers.get("content-type") || "application/octet-stream" };
+    return { buffer: buf, size: buf.length, filename, contentType };
   }
   const st = statSync(src);
   log("reading local file:", src, st.size, "bytes");

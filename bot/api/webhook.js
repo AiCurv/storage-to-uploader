@@ -42,25 +42,25 @@ function mainMenu() {
 }
 
 // Convert known "share page" URLs into the underlying direct-download URL.
-// Gofile, pixeldrain, and similar hosts serve an HTML landing page on the
-// share link and a separate raw URL. We translate here so the workflow
-// fetches bytes, not HTML.
+// The upload.mjs script has its own resolveSource() which further normalizes
+// pixeldrain URLs (adding ?download and browser UA). Here we just make sure
+// the URL points at a file endpoint, not a viewer page.
 function normalizeSourceUrl(text) {
   let url;
   try { url = new URL(text.trim()); } catch { return null; }
   const host = url.host.toLowerCase();
   const path = url.pathname;
 
-  // pixeldrain: https://pixeldrain.com/u/<id>  ->  https://pixeldrain.com/api/file/<id>
+  // pixeldrain: /u/<id> is an HTML viewer. /api/file/<id> serves the bytes.
+  // We rewrite /u/<id> → /api/file/<id> so upload.mjs gets a file endpoint.
+  // upload.mjs will add ?download + browser UA automatically.
   if (host === "pixeldrain.com" || host.endsWith(".pixeldrain.com")) {
     const m = path.match(/^\/u\/([A-Za-z0-9]+)/);
     if (m) return `https://pixeldrain.com/api/file/${m[1]}`;
+    // /d/<id> is also a viewer; rewrite to /api/file/<id>
+    const m2 = path.match(/^\/d\/([A-Za-z0-9]+)/);
+    if (m2) return `https://pixeldrain.com/api/file/${m2[1]}`;
   }
-
-  // gofile: /d/<id> shares a page; the raw download requires a token
-  // fetched at runtime. We leave the page URL for the user to translate
-  // manually, but if a /download/web/<id>/<name> URL is already in hand
-  // we pass it through (no rewrite needed).
 
   return null; // no rewrite - pass through to the workflow
 }
