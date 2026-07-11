@@ -73,11 +73,15 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
 
   if (init.type === "single") {
     log("single PUT to R2, streaming from disk...");
-    // Stream the file directly from disk — no memory buffering
+    // R2 requires Content-Length header — must include it even when streaming from disk
+    const putHeaders = {
+      ...(init.headers || {}),
+      "Content-Length": String(fileSize),
+    };
     const fileStream = createReadStream(filePath);
     const putRes = await fetch(init.upload_url, {
       method: "PUT",
-      headers: init.headers || {},
+      headers: putHeaders,
       body: fileStream,
       duplex: "half",
     });
