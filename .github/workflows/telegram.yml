@@ -39,26 +39,43 @@ jobs:
 
       - name: Run upload
         env:
-          CHAT_ID: ${{ github.event.client_payload.chat_id }}
-          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          EVENT_PAYLOAD: ${{ toJSON(github.event) }}
         shell: bash
         run: |
           set -euo pipefail
-          # Pick up inputs from either repository_dispatch (client_payload) or manual dispatch.
+
+          # Dump full event to debug file
+          echo "$EVENT_PAYLOAD" > /tmp/event.json
+          echo "::notice title=event dump::$(head -c 400 /tmp/event.json)"
+
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            SOURCE="${{ github.event.client_payload.source_url }}"
-            FILENAME="${{ github.event.client_payload.filename }}"
-            CHAT_ID_VAL="${CHAT_ID:-}"
-            CALLBACK_VAL="${CALLBACK_URL:-}"
+            # Read client_payload from the saved file using node (handles JSON safely)
+            SOURCE=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.source_url||"")}catch(_){process.stdout.write("")}')
+            FILENAME=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.filename||"")}catch(_){process.stdout.write("")}')
+            CHAT_ID_VAL=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.chat_id?String(p.chat_id):"")}catch(_){process.stdout.write("")}')
+            CALLBACK_VAL="$VERCEL_CALLBACK_URL"
           else
             SOURCE="${{ inputs.source }}"
             FILENAME="${{ inputs.filename }}"
             CHAT_ID_VAL=""
             CALLBACK_VAL=""
           fi
+
           echo "source=$SOURCE"
           echo "filename=$FILENAME"
           echo "chat_id=$CHAT_ID_VAL"
+
+          if [ -z "$SOURCE" ]; then
+            echo "::error::No source URL provided in client_payload"
+            if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
+              ERR_PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,error:"empty source_url in dispatch payload"}))')
+              curl -fsS -X POST "$CALLBACK_VAL" \
+                -H "Content-Type: application/json" \
+                -H "X-Verify: $VERIFY_TOKEN" \
+                -d "$ERR_PAYLOAD" || true
+            fi
+            exit 1
+          fi
 
           ARGS=( "$SOURCE" )
           [ -n "$FILENAME" ] && ARGS+=( "$FILENAME" )
