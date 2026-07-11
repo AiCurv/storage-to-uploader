@@ -178,14 +178,18 @@ function resolveSource(rawUrl) {
   const u = new URL(rawUrl);
   const host = u.hostname.toLowerCase();
 
-  // Pixeldrain: /u/<id> and /d/<id> are HTML viewers → rewrite to /api/file/<id>?download
+  // Pixeldrain: /u/<id> and /d/<id> are HTML viewers → rewrite to /api/file/<id>
+  // /api/file/<id> already serves raw file bytes, no ?download needed (avoids hotlink detection)
   if (host === "pixeldrain.com" || host === "www.pixeldrain.com") {
     const m = u.pathname.match(/^\/(?:u|api\/file|d)\/([A-Za-z0-9]+)/);
     if (m) {
-      const fixed = new URL(`/api/file/${m[1]}?download`, u);
+      const fixed = new URL(`/api/file/${m[1]}`, u);
       return { url: fixed.toString(), headers: { "User-Agent": UA } };
     }
   }
+
+  // GoFile: /d/<id> is a share page → need to get content link via API
+  // (not yet implemented - pass through and hope it's a direct link)
 
   // Default: pass-through with browser UA for any URL
   return { url: rawUrl, headers: { "User-Agent": UA } };
@@ -420,37 +424,50 @@ async function main() {
 
   const { url: resolvedUrl, headers: downloadHeaders } = resolveSource(srcArg);
 
-  // ── Step 1: Download file to disk ──
+  // ── Step 1: Download file to disk using curl (most reliable for large files) ──
   log("downloading source:", resolvedUrl);
-  const dlResponse = await fetch(resolvedUrl, { redirect: "follow", headers: downloadHeaders });
-  if (!dlResponse.ok) throw new Error(`source fetch ${dlResponse.status} ${resolvedUrl}`);
 
-  const contentType = dlResponse.headers.get("content-type") || "application/octet-stream";
-  if (contentType.startsWith("text/html") && !srcArg.endsWith(".html") && !srcArg.endsWith(".htm")) {
-    throw new Error(
-      `source returned HTML (content-type: ${contentType}), not a file. ` +
-      `The URL may be a share-page link rather than a direct download link.`
-    );
+  let workName = overrideName || guessFilename(srcArg, null) || "file";
+  const dlPath = join(WORK_DIR, "download" + (extname(workName).toLowerCase() || ".bin"));
+  let contentType = "application/octet-stream";
+
+  // First, do a HEAD request to check content-type and get filename
+  try {
+    const headRes = await fetch(resolvedUrl, { method: "HEAD", redirect: "follow", headers: downloadHeaders });
+    contentType = headRes.headers.get("content-type") || "application/octet-stream";
+    if (contentType.startsWith("text/html") && !srcArg.endsWith(".html") && !srcArg.endsWith(".htm")) {
+      throw new Error(
+        `source returned HTML (content-type: ${contentType}), not a file. ` +
+        `The URL may be a share-page link rather than a direct download link.`
+      );
+    }
+    const cd = headRes.headers.get("content-disposition");
+    if (cd && !overrideName) {
+      const guessed = guessFilename(srcArg, cd);
+      if (guessed && guessed !== "file") workName = guessed;
+    }
+    const cl = headRes.headers.get("content-length");
+    if (cl) log(`content-length: ${(parseInt(cl) / 1024 / 1024).toFixed(1)} MB`);
+  } catch (headErr) {
+    // HEAD might not be supported — we'll discover content-type during download
+    log("HEAD request failed, will check content-type after download");
   }
 
-  let workName = overrideName || guessFilename(srcArg, dlResponse.headers.get("content-disposition")) || "file";
-  const dlPath = join(WORK_DIR, "download" + extname(workName).toLowerCase() || ".bin");
-
-  // Stream download to disk — no memory buffering
-  log("streaming download to disk:", dlPath);
-  const contentLength = dlResponse.headers.get("content-length");
-  if (contentLength) log(`content-length: ${(parseInt(contentLength) / 1024 / 1024).toFixed(1)} MB`);
-
-  const fileWriter = require("fs").createWriteStream(dlPath);
-  const reader = dlResponse.body;
-  const nodeStream = require("stream");
-  await new Promise((resolve, reject) => {
-    const readable = nodeStream.Readable.fromWeb(reader);
-    readable.pipe(fileWriter);
-    fileWriter.on("finish", resolve);
-    fileWriter.on("error", reject);
-    readable.on("error", reject);
-  });
+  // Download with curl — handles large files, redirects, retries natively
+  const headerArgs = Object.entries(downloadHeaders || {}).map(([k, v]) => `-H '${k}: ${v}'`).join(" ");
+  const curlCmd = `curl -fSL --retry 3 --retry-delay 5 -o "${dlPath}" ${headerArgs} "${resolvedUrl}"`;
+  log("downloading with curl...");
+  try {
+    execSync(curlCmd, { stdio: ["pipe", "pipe", "pipe"], timeout: 1800_000 }); // 30 min
+  } catch (curlErr) {
+    // If curl fails, try fetch as fallback (for environments without curl)
+    log("curl failed, trying fetch-based download...");
+    const dlResponse = await fetch(resolvedUrl, { redirect: "follow", headers: downloadHeaders });
+    if (!dlResponse.ok) throw new Error(`source fetch ${dlResponse.status} ${resolvedUrl}`);
+    contentType = dlResponse.headers.get("content-type") || "application/octet-stream";
+    const buf = Buffer.from(await dlResponse.arrayBuffer());
+    writeFileSync(dlPath, buf);
+  }
 
   const dlSize = statSync(dlPath).size;
   log(`download complete: ${dlSize} bytes (${(dlSize / 1024 / 1024).toFixed(1)} MB)`);

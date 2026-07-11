@@ -1,0 +1,17 @@
+{
+  "name": "storage-to-uploader",
+  "version": "1.0.0",
+  "description": "Anonymous uploads to [storage.to](https://storage.to) from GitHub Actions.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AiCurv/storage-to-uploader.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module"
+}
