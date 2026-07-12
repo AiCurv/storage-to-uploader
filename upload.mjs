@@ -113,23 +113,45 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
     }
     log(`all ${totalParts} part URLs fetched`);
 
-    // Upload parts with concurrency
-    async function uploadPart(partNumber) {
+    // Upload parts with concurrency + retry for transient R2 errors
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 3000;
+
+    async function uploadPart(partNumber, attempt = 1) {
       const partUrl = init.initial_urls[String(partNumber)];
       if (!partUrl) throw new Error(`no URL for part ${partNumber}`);
       const start = (partNumber - 1) * partSize;
       const end = Math.min(start + partSize, fileSize) - 1;
-      const partStream = createReadStream(filePath, { start, end, highWaterMark: 1024 * 1024 });
-      const pr = await fetch(partUrl, {
-        method: "PUT",
-        body: partStream,
-        duplex: "half",
-        headers: { "Content-Length": String(end - start + 1) },
-      });
-      if (!pr.ok) throw new Error(`R2 part ${partNumber} PUT ${pr.status}: ${await pr.text()}`);
-      const etag = pr.headers.get("etag") || pr.headers.get("ETag");
-      if (!etag) throw new Error(`R2 part ${partNumber} missing etag header`);
-      return { partNumber, etag };
+      try {
+        const partStream = createReadStream(filePath, { start, end, highWaterMark: 1024 * 1024 });
+        const pr = await fetch(partUrl, {
+          method: "PUT",
+          body: partStream,
+          duplex: "half",
+          headers: { "Content-Length": String(end - start + 1) },
+        });
+        if (!pr.ok) {
+          const errBody = await pr.text();
+          // Retry on 5xx (502 Bad Gateway, 503 Service Unavailable, etc.)
+          if (pr.status >= 500 && attempt < MAX_RETRIES) {
+            log(`R2 part ${partNumber} PUT ${pr.status} (attempt ${attempt}/${MAX_RETRIES}), retrying in ${RETRY_DELAY_MS}ms...`);
+            await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
+            return uploadPart(partNumber, attempt + 1);
+          }
+          throw new Error(`R2 part ${partNumber} PUT ${pr.status}: ${errBody.slice(0, 300)}`);
+        }
+        const etag = pr.headers.get("etag") || pr.headers.get("ETag");
+        if (!etag) throw new Error(`R2 part ${partNumber} missing etag header`);
+        return { partNumber, etag };
+      } catch (err) {
+        // Retry on network errors too
+        if (attempt < MAX_RETRIES && (err.code === 'ECONNRESET' || err.code === 'ENOTFOUND' || err.message.includes('fetch failed'))) {
+          log(`R2 part ${partNumber} network error (attempt ${attempt}/${MAX_RETRIES}), retrying...`);
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
+          return uploadPart(partNumber, attempt + 1);
+        }
+        throw err;
+      }
     }
 
     // Process in batches of CONCURRENCY
@@ -330,9 +352,13 @@ async function main() {
       );
     }
     const cd = headRes.headers.get("content-disposition");
-    if (cd && !overrideName) {
+    if (cd) {
       const guessed = guessFilename(srcArg, cd);
-      if (guessed && guessed !== "file") workName = guessed;
+      // content-disposition filename is always the real filename — override even if overrideName was passed from URL
+      if (guessed && guessed !== "file" && guessed.length > 3) {
+        workName = guessed;
+        log(`using content-disposition filename: ${workName}`);
+      }
     }
     const cl = headRes.headers.get("content-length");
     if (cl) log(`content-length: ${(parseInt(cl) / 1024 / 1024).toFixed(1)} MB`);
