@@ -10,7 +10,7 @@
 //   STORAGE_TO_API            - override API base (default https://storage.to/api)
 //   WORK_DIR                  - override temp working dir (default: /tmp/storageto)
 
-import { writeFileSync, readFileSync, statSync, mkdirSync, rmSync, createReadStream } from "node:fs";
+import { writeFileSync, statSync, mkdirSync, rmSync, createReadStream } from "node:fs";
 import { basename, join, extname } from "node:path";
 import { execSync } from "node:child_process";
 
@@ -103,14 +103,22 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
         partUrl = init.initial_urls[String(partNumber)];
       }
       const start = i * partSize;
-      const end = Math.min(start + partSize, fileSize);
-      log(`part ${partNumber}/${totalParts}: bytes ${start}-${end}`);
-      const chunkBuf = readFileSync(filePath, { start, end });
-      const pr = await fetch(partUrl, { method: "PUT", body: chunkBuf });
+      const end = Math.min(start + partSize, fileSize) - 1; // createReadStream end is inclusive
+      log(`part ${partNumber}/${totalParts}: bytes ${start}-${end + 1}`);
+      // Use createReadStream with start/end to avoid ERR_FS_FILE_TOO_LARGE for files >2GB
+      // readFileSync allocates a buffer for the full file size even with start/end
+      const partStream = createReadStream(filePath, { start, end, highWaterMark: 1024 * 1024 });
+      const pr = await fetch(partUrl, {
+        method: "PUT",
+        body: partStream,
+        duplex: "half",
+        headers: { "Content-Length": String(end - start + 1) },
+      });
       if (!pr.ok) throw new Error(`R2 part ${partNumber} PUT ${pr.status}: ${await pr.text()}`);
       const etag = pr.headers.get("etag") || pr.headers.get("ETag");
       if (!etag) throw new Error(`R2 part ${partNumber} missing etag header`);
       completedParts.push({ partNumber, etag });
+      log(`part ${partNumber}/${totalParts} done (etag: ${etag})`);
     }
     log("complete-multipart");
     await api("/upload/complete-multipart", {
