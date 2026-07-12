@@ -97,8 +97,10 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
           upload_id: init.upload_id,
           part_numbers: Array.from({ length: Math.min(totalParts - i, 50) }, (_, k) => i + k + 1),
         });
-        for (const p of more.part_urls) {
-          init.initial_urls[String(p.partNumber)] = p.url;
+        // API returns { success: true, urls: { "51": "https://...", "52": "..." } }
+        const urlMap = more.urls || {};
+        for (const [num, url] of Object.entries(urlMap)) {
+          init.initial_urls[num] = url;
         }
         partUrl = init.initial_urls[String(partNumber)];
       }
