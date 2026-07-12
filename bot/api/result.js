@@ -1,8 +1,13 @@
 // Called by GitHub Actions workflow when upload finishes.
-// Body: { chat_id, url, raw_url, filename, size_bytes, human_size, expires_at, error }
-// We send the storage.to link to the user. That's it. No file upload to Telegram.
+// Body: { chat_id, service, url, raw_url, filename, size_bytes, human_size, expires_at, error }
+// We send the resulting link to the user. That's it. No file upload to Telegram.
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
+
+const SERVICE_LABELS = {
+  storageto:  "📦 storage.to",
+  pixeldrain: "🎬 pixeldrain",
+};
 
 async function sendMessage(chatId, text, extra = {}) {
   await fetch(`${TELEGRAM_API}/sendMessage`, {
@@ -48,19 +53,29 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   }
 
-  // Send the storage.to link to user
+  // Send the link to user
   const size = body.human_size || humanSize(body.size_bytes);
-  const msg = [
+  const service = body.service || "storageto";
+  const serviceLabel = SERVICE_LABELS[service] || service;
+
+  const msgLines = [
     `✅ <b>Upload Complete!</b>`,
     ``,
     `📦 <b>${body.filename}</b> (${size})`,
+    `📤 Service: ${serviceLabel}`,
     ``,
     `🔗 <a href="${body.url}">Download Link</a>`,
-    ``,
-    body.expires_at ? `⏰ Expires: ${body.expires_at}` : "",
-  ].filter(Boolean).join("\n");
+  ];
+  if (body.raw_url) {
+    msgLines.push(`⬇️ <a href="${body.raw_url}">Direct download (raw)</a>`);
+  }
+  if (body.expires_at) {
+    msgLines.push(`⏰ Expires: ${body.expires_at}`);
+  } else if (service === "pixeldrain") {
+    msgLines.push(`♾️ Pixeldrain files do not expire`);
+  }
 
-  await sendMessage(chatId, msg);
+  await sendMessage(chatId, msgLines.filter(Boolean).join("\n"));
 
   return res.status(200).json({ ok: true });
 }

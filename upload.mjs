@@ -1,13 +1,16 @@
 #!/usr/bin/env node
-// storage-to-uploader: download → upload to storage.to → return HTML link
+// storage-to-uploader: download → upload to storage.to OR pixeldrain → return link
 // NO FFmpeg, NO conversion, NO subtitle extraction. Just raw passthrough.
 //
 // Usage:
-//   node upload.mjs <url> [filename] [content-type]
+//   node upload.mjs <url> [filename] [content-type] [service]
+//     service: "storageto" (default) | "pixeldrain"
 //
 // Env:
 //   STORAGE_TO_VISITOR_TOKEN  - reused across runs to keep "ownership" of uploads
 //   STORAGE_TO_API            - override API base (default https://storage.to/api)
+//   PIXELDRAIN_TOKEN          - API key for pixeldrain (REQUIRED when service=pixeldrain)
+//   PIXELDRAIN_API            - override API base (default https://pixeldrain.com/api)
 //   WORK_DIR                  - override temp working dir (default: /tmp/storageto)
 
 import { writeFileSync, statSync, mkdirSync, rmSync, createReadStream } from "node:fs";
@@ -18,6 +21,9 @@ const API = process.env.STORAGE_TO_API || "https://storage.to/api";
 const VISITOR = process.env.STORAGE_TO_VISITOR_TOKEN || cryptoRandom();
 const WORK_DIR = process.env.WORK_DIR || "/tmp/storageto";
 
+const PIXELDRAIN_API = process.env.PIXELDRAIN_API || "https://pixeldrain.com/api";
+const PIXELDRAIN_TOKEN = process.env.PIXELDRAIN_TOKEN || "";
+
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 function cryptoRandom() {
@@ -27,12 +33,20 @@ function cryptoRandom() {
 }
 
 function log(...args) {
-  console.error("[storage-to]", new Date().toISOString(), ...args);
+  console.error("[uploader]", new Date().toISOString(), ...args);
+}
+
+function humanSize(n) {
+  if (!n) return "?";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
 }
 
 // ─── storage.to API ──────────────────────────────────────────────
 
-async function api(path, body) {
+async function storageToApi(path, body) {
   const r = await fetch(`${API}${path}`, {
     method: "POST",
     headers: {
@@ -53,13 +67,13 @@ async function api(path, body) {
 
 /**
  * Upload a file from disk to storage.to using streaming (no memory buffering).
- * Returns { url, raw_url, file_id, filename, size, human_size, expires_at }.
+ * Returns { service, url, raw_url, file_id, filename, size, human_size, expires_at }.
  */
-async function uploadFileFromDisk(filePath, filename, contentType) {
+async function uploadToStorageTo(filePath, filename, contentType) {
   const fileSize = statSync(filePath).size;
-  log(`upload: filename=${filename} size=${fileSize} type=${contentType} path=${filePath}`);
+  log(`[storageto] upload: filename=${filename} size=${fileSize} type=${contentType} path=${filePath}`);
 
-  const init = await api("/upload/init", {
+  const init = await storageToApi("/upload/init", {
     filename,
     content_type: contentType,
     size: fileSize,
@@ -68,7 +82,7 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
   const r2Key = init.r2_key;
 
   if (init.type === "single") {
-    log("single PUT to R2, streaming from disk...");
+    log("[storageto] single PUT to R2, streaming from disk...");
     const putHeaders = {
       ...(init.headers || {}),
       "Content-Length": String(fileSize),
@@ -84,7 +98,7 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
       const t = await putRes.text();
       throw new Error(`R2 PUT ${putRes.status}: ${t.slice(0, 500)}`);
     }
-    log("single PUT complete");
+    log("[storageto] single PUT complete");
   } else if (init.type === "multipart") {
     const partSize = init.part_size;
     const totalParts = init.total_parts;
@@ -92,16 +106,14 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
     const CONCURRENCY = 3; // Upload 3 parts concurrently for speed
 
     // Prefetch all part URLs in batches of 50
-    // The init response gives us the first batch (in initial_urls)
-    // We need to fetch the rest via /upload/parts
-    log(`prefetching part URLs for ${totalParts} parts...`);
+    log(`[storageto] prefetching part URLs for ${totalParts} parts...`);
     const allPartNumbers = Array.from({ length: totalParts }, (_, k) => k + 1);
     for (let batch = 0; batch < totalParts; batch += 50) {
       const batchNums = allPartNumbers.slice(batch, batch + 50);
       // Skip parts we already have URLs for (from init.initial_urls)
       const missing = batchNums.filter(n => !init.initial_urls[String(n)]);
       if (missing.length > 0) {
-        const more = await api("/upload/parts", {
+        const more = await storageToApi("/upload/parts", {
           upload_id: init.upload_id,
           part_numbers: missing,
         });
@@ -111,7 +123,7 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
         }
       }
     }
-    log(`all ${totalParts} part URLs fetched`);
+    log(`[storageto] all ${totalParts} part URLs fetched`);
 
     // Upload parts with concurrency + retry for transient R2 errors
     const MAX_RETRIES = 3;
@@ -134,7 +146,7 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
           const errBody = await pr.text();
           // Retry on 5xx (502 Bad Gateway, 503 Service Unavailable, etc.)
           if (pr.status >= 500 && attempt < MAX_RETRIES) {
-            log(`R2 part ${partNumber} PUT ${pr.status} (attempt ${attempt}/${MAX_RETRIES}), retrying in ${RETRY_DELAY_MS}ms...`);
+            log(`[storageto] R2 part ${partNumber} PUT ${pr.status} (attempt ${attempt}/${MAX_RETRIES}), retrying in ${RETRY_DELAY_MS}ms...`);
             await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
             return uploadPart(partNumber, attempt + 1);
           }
@@ -146,7 +158,7 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
       } catch (err) {
         // Retry on network errors too
         if (attempt < MAX_RETRIES && (err.code === 'ECONNRESET' || err.code === 'ENOTFOUND' || err.message.includes('fetch failed'))) {
-          log(`R2 part ${partNumber} network error (attempt ${attempt}/${MAX_RETRIES}), retrying...`);
+          log(`[storageto] R2 part ${partNumber} network error (attempt ${attempt}/${MAX_RETRIES}), retrying...`);
           await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
           return uploadPart(partNumber, attempt + 1);
         }
@@ -161,15 +173,15 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
       completedParts.push(...batchResults);
       const lastDone = batch + batchPartNums.length;
       if (lastDone % 30 === 0 || lastDone === totalParts) {
-        log(`uploaded ${lastDone}/${totalParts} parts`);
+        log(`[storageto] uploaded ${lastDone}/${totalParts} parts`);
       }
     }
 
     // Sort by part number for the complete-multipart call
     completedParts.sort((a, b) => a.partNumber - b.partNumber);
 
-    log("complete-multipart");
-    await api("/upload/complete-multipart", {
+    log("[storageto] complete-multipart");
+    await storageToApi("/upload/complete-multipart", {
       upload_id: init.upload_id,
       parts: completedParts,
     });
@@ -177,8 +189,8 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
     throw new Error(`unexpected init response type: ${init.type}`);
   }
 
-  log("confirming upload...");
-  const confirm = await api("/upload/confirm", {
+  log("[storageto] confirming upload...");
+  const confirm = await storageToApi("/upload/confirm", {
     filename,
     size: fileSize,
     content_type: contentType,
@@ -186,9 +198,10 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
   });
 
   const f = confirm.file;
-  log("confirmed:", f.url);
+  log("[storageto] confirmed:", f.url);
 
   return {
+    service: "storageto",
     url: f.url,             // HTML page — THIS is what we send to user
     raw_url: f.raw_url,     // Direct download link
     file_id: f.id,
@@ -197,6 +210,95 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
     human_size: f.human_size,
     expires_at: f.expires_at,
   };
+}
+
+// ─── pixeldrain API ──────────────────────────────────────────────
+
+/**
+ * Upload a file from disk to pixeldrain using streaming PUT.
+ * API: PUT /api/file/{name}  with raw body and HTTP Basic Auth (":" + api_key).
+ * Returns { service, url, raw_url, file_id, filename, size, human_size, expires_at }.
+ */
+async function uploadToPixeldrain(filePath, filename, contentType) {
+  if (!PIXELDRAIN_TOKEN) {
+    throw new Error("PIXELDRAIN_TOKEN env var is required for service=pixeldrain");
+  }
+  const fileSize = statSync(filePath).size;
+  log(`[pixeldrain] upload: filename=${filename} size=${fileSize} (${humanSize(fileSize)}) type=${contentType} path=${filePath}`);
+
+  // Pixeldrain expects PUT /file/{name} with raw body, name URL-encoded
+  // Auth: HTTP Basic, empty username, API key as password
+  const basicAuth = "Basic " + Buffer.from(`:${PIXELDRAIN_TOKEN}`).toString("base64");
+  const uploadUrl = `${PIXELDRAIN_API}/file/${encodeURIComponent(filename)}`;
+
+  log(`[pixeldrain] PUT ${uploadUrl} (streaming from disk)...`);
+
+  // Stream the file from disk to pixeldrain — no buffering needed
+  const fileStream = createReadStream(filePath);
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY_MS = 5000;
+
+  async function attempt(tryNum = 1) {
+    const stream = createReadStream(filePath); // fresh stream each attempt
+    const r = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        "Authorization": basicAuth,
+        "Content-Type": contentType || "application/octet-stream",
+        "Content-Length": String(fileSize),
+      },
+      body: stream,
+      duplex: "half",
+    });
+    const text = await r.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = { raw: text }; }
+
+    if (!r.ok || json.success === false) {
+      const errMsg = json.message || json.value || text.slice(0, 300);
+      // Retry on 5xx and certain network errors
+      if (tryNum < MAX_RETRIES && (r.status >= 500 || r.status === 429)) {
+        log(`[pixeldrain] PUT ${r.status} (attempt ${tryNum}/${MAX_RETRIES}): ${errMsg}. Retrying in ${RETRY_DELAY_MS * tryNum}ms...`);
+        await new Promise(r => setTimeout(r, RETRY_DELAY_MS * tryNum));
+        return attempt(tryNum + 1);
+      }
+      throw new Error(`pixeldrain PUT ${r.status} (${json.value || "error"}): ${errMsg}`);
+    }
+    return json;
+  }
+
+  let json;
+  try {
+    json = await attempt(1);
+  } catch (err) {
+    // Final network-error retry path
+    if (err.message && err.message.includes("fetch failed")) {
+      log(`[pixeldrain] network error on attempt, retrying once more after 10s...`);
+      await new Promise(r => setTimeout(r, 10000));
+      json = await attempt(2);
+    } else {
+      throw err;
+    }
+  }
+
+  const id = json.id;
+  if (!id) {
+    throw new Error(`pixeldrain upload returned no id: ${JSON.stringify(json).slice(0, 300)}`);
+  }
+
+  const result = {
+    service: "pixeldrain",
+    url: `https://pixeldrain.com/u/${id}`,            // HTML viewer page
+    raw_url: `https://pixeldrain.com/api/file/${id}`, // Direct download
+    file_id: id,
+    filename: json.name || filename,
+    size: json.size || fileSize,
+    human_size: humanSize(json.size || fileSize),
+    expires_at: "",  // pixeldrain files don't expire
+  };
+
+  log(`[pixeldrain] upload complete: ${result.url} (${result.human_size})`);
+  return result;
 }
 
 // ─── URL resolvers ───────────────────────────────────────────────
@@ -295,14 +397,30 @@ function guessFilename(url, contentDisposition) {
   return "file";
 }
 
+// ─── Service dispatcher ──────────────────────────────────────────
+
+async function uploadToService(service, filePath, filename, contentType) {
+  if (service === "pixeldrain") {
+    return uploadToPixeldrain(filePath, filename, contentType);
+  }
+  if (service === "storageto" || service === "storage.to" || service === "storage_to") {
+    return uploadToStorageTo(filePath, filename, contentType);
+  }
+  throw new Error(`unknown service: "${service}". Valid: storageto | pixeldrain`);
+}
+
 // ─── Main ────────────────────────────────────────────────────────
 
 async function main() {
-  const [, , srcArg, overrideName, overrideType] = process.argv;
+  const [, , srcArg, overrideName, overrideType, overrideService] = process.argv;
   if (!srcArg) {
-    console.error("usage: upload.mjs <url> [filename] [content-type]");
+    console.error("usage: upload.mjs <url> [filename] [content-type] [service]");
+    console.error("       service: storageto (default) | pixeldrain");
     process.exit(2);
   }
+
+  const service = (overrideService || process.env.UPLOAD_SERVICE || "storageto").toLowerCase();
+  log(`service = ${service}`);
 
   // Create work directory
   mkdirSync(WORK_DIR, { recursive: true });
@@ -315,15 +433,15 @@ async function main() {
     // tgfile:<file_id>:<filename>
     const fileId = parts.slice(1, -1).join(":"); // file_id might contain colons? No, but be safe
     const tgFileName = parts[parts.length - 1] || "file";
-    
+
     const tgResult = await downloadTelegramFile(fileId, decodeURIComponent(tgFileName));
     const workName = overrideName || tgResult.fileName;
     const contentType = overrideType || tgResult.contentType;
 
-    const mainResult = await uploadFileFromDisk(tgResult.filePath, workName, contentType);
-    
+    const mainResult = await uploadToService(service, tgResult.filePath, workName, contentType);
+
     try { rmSync(WORK_DIR, { recursive: true, force: true }); } catch {}
-    
+
     const output = { main: mainResult };
     process.stdout.write("RESULT_JSON_BEGIN\n" + JSON.stringify(output, null, 2) + "\nRESULT_JSON_END\n");
     return;
@@ -385,8 +503,8 @@ async function main() {
   const dlSize = statSync(dlPath).size;
   log(`download complete: ${dlSize} bytes (${(dlSize / 1024 / 1024).toFixed(1)} MB)`);
 
-  // ── Step 2: Upload directly to storage.to — NO conversion, NO FFmpeg ──
-  const mainResult = await uploadFileFromDisk(dlPath, workName, contentType);
+  // ── Step 2: Upload to the selected service ──
+  const mainResult = await uploadToService(service, dlPath, workName, contentType);
 
   // Cleanup
   try { rmSync(WORK_DIR, { recursive: true, force: true }); log("cleaned up work dir"); } catch {}

@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       source:
-        description: "HTTP(S) URL to download and upload to storage.to"
+        description: "HTTP(S) URL to download and upload"
         required: true
         type: string
       filename:
@@ -14,6 +14,14 @@ on:
         required: false
         type: string
         default: ""
+      service:
+        description: "Upload service: storageto | pixeldrain"
+        required: false
+        type: choice
+        default: "storageto"
+        options:
+          - storageto
+          - pixeldrain
 
 jobs:
   upload:
@@ -21,6 +29,7 @@ jobs:
     timeout-minutes: 120
     env:
       STORAGE_TO_VISITOR_TOKEN: ${{ secrets.STORAGE_TO_VISITOR_TOKEN }}
+      PIXELDRAIN_TOKEN: ${{ secrets.PIXELDRAIN_TOKEN }}
       VERCEL_CALLBACK_URL: ${{ secrets.VERCEL_CALLBACK_URL }}
       VERIFY_TOKEN: ${{ secrets.BOT_VERIFY_TOKEN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -44,7 +53,7 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Download and upload to storage.to
+      - name: Download and upload
         env:
           EVENT_PAYLOAD: ${{ toJSON(github.event) }}
         shell: bash
@@ -57,22 +66,45 @@ jobs:
             SOURCE=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.source_url||"")}catch(_){process.stdout.write("")}')
             FILENAME=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.filename||"")}catch(_){process.stdout.write("")}')
             CHAT_ID_VAL=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.chat_id?String(p.chat_id):"")}catch(_){process.stdout.write("")}')
+            SERVICE_VAL=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.service||"")}catch(_){process.stdout.write("")}')
             CALLBACK_VAL="$VERCEL_CALLBACK_URL"
           else
             SOURCE="${{ inputs.source }}"
             FILENAME="${{ inputs.filename }}"
+            SERVICE_VAL="${{ inputs.service }}"
             CHAT_ID_VAL=""
             CALLBACK_VAL=""
           fi
 
-          echo "source=$SOURCE"
-          echo "filename=$FILENAME"
-          echo "chat_id=$CHAT_ID_VAL"
+          # Default service to storageto if missing/empty
+          if [ -z "$SERVICE_VAL" ]; then
+            SERVICE_VAL="storageto"
+          fi
+
+          echo "===== DISPATCH PAYLOAD ====="
+          echo "source   = $SOURCE"
+          echo "filename = $FILENAME"
+          echo "service  = $SERVICE_VAL"
+          echo "chat_id  = $CHAT_ID_VAL"
+          echo "============================"
 
           if [ -z "$SOURCE" ]; then
             echo "::error::No source URL provided"
             if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
-              ERR_PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,error:"empty source_url in dispatch payload"}))')
+              ERR_PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" SERVICE_VAL="$SERVICE_VAL" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,service:process.env.SERVICE_VAL,error:"empty source_url in dispatch payload"}))')
+              curl -fsS -X POST "$CALLBACK_VAL" \
+                -H "Content-Type: application/json" \
+                -H "X-Verify: $VERIFY_TOKEN" \
+                -d "$ERR_PAYLOAD" || true
+            fi
+            exit 1
+          fi
+
+          # Service-specific env validation
+          if [ "$SERVICE_VAL" = "pixeldrain" ] && [ -z "$PIXELDRAIN_TOKEN" ]; then
+            echo "::error::service=pixeldrain but PIXELDRAIN_TOKEN secret is not set"
+            if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
+              ERR_PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" SERVICE_VAL="$SERVICE_VAL" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,service:process.env.SERVICE_VAL,error:"PIXELDRAIN_TOKEN secret not configured"}))')
               curl -fsS -X POST "$CALLBACK_VAL" \
                 -H "Content-Type: application/json" \
                 -H "X-Verify: $VERIFY_TOKEN" \
@@ -83,6 +115,12 @@ jobs:
 
           ARGS=( "$SOURCE" )
           [ -n "$FILENAME" ] && ARGS+=( "$FILENAME" )
+          # Pass content_type as empty string so upload.mjs falls back to HEAD-detected type
+          ARGS+=( "" )
+          # 4th arg = service
+          ARGS+=( "$SERVICE_VAL" )
+
+          echo "Running: node upload.mjs <url> '${FILENAME}' '' '${SERVICE_VAL}'"
 
           set +e
           OUT=$(node upload.mjs "${ARGS[@]}" 2>&1 | tee /dev/stderr)
@@ -93,7 +131,7 @@ jobs:
           if [ $STATUS -ne 0 ] || [ -z "$JSON" ]; then
             echo "::error::upload script failed (exit $STATUS)"
             if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
-              ERR_PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,error:"upload script failed (exit "+process.argv[1]+")"}))' "$STATUS")
+              ERR_PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" SERVICE_VAL="$SERVICE_VAL" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,service:process.env.SERVICE_VAL,error:"upload script failed (exit "+process.argv[1]+")"}))' "$STATUS")
               curl -fsS -X POST "$CALLBACK_VAL" \
                 -H "Content-Type: application/json" \
                 -H "X-Verify: $VERIFY_TOKEN" \
@@ -111,17 +149,20 @@ jobs:
           MAIN_SIZE=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(String(r.main?.size||0))")
           MAIN_HSIZE=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.human_size||'')")
           MAIN_EXPIRES=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.expires_at||'')")
+          MAIN_SERVICE=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.service||'$SERVICE_VAL')")
 
-          echo "::notice title=storage.to HTML::$MAIN_URL"
-          echo "::notice title=storage.to raw::$MAIN_RAW"
+          echo "::notice title=service::$MAIN_SERVICE"
+          echo "::notice title=$MAIN_SERVICE HTML::$MAIN_URL"
+          echo "::notice title=$MAIN_SERVICE raw::$MAIN_RAW"
           echo "::notice title=filename::$MAIN_FNAME"
           echo "::notice title=size::$MAIN_HSIZE"
 
           # ── Callback to Vercel bot with results ──
           if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
-            PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" URL="$MAIN_URL" RAW="$MAIN_RAW" FNAME="$MAIN_FNAME" SIZE="$MAIN_SIZE" HSIZE="$MAIN_HSIZE" EXPIRES="$MAIN_EXPIRES" node -e '
+            PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" URL="$MAIN_URL" RAW="$MAIN_RAW" FNAME="$MAIN_FNAME" SIZE="$MAIN_SIZE" HSIZE="$MAIN_HSIZE" EXPIRES="$MAIN_EXPIRES" SERVICE="$MAIN_SERVICE" node -e '
               const o = {
                 chat_id: process.env.CHAT_ID_VAL,
+                service: process.env.SERVICE,
                 url: process.env.URL,
                 raw_url: process.env.RAW,
                 filename: process.env.FNAME,

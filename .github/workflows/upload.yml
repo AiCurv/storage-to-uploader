@@ -1,10 +1,10 @@
-name: Upload to storage.to
+name: Upload to storage.to / pixeldrain
 
 on:
   workflow_dispatch:
     inputs:
       source:
-        description: "HTTP(S) URL to upload to storage.to"
+        description: "HTTP(S) URL to upload"
         required: true
         type: string
       filename:
@@ -12,6 +12,14 @@ on:
         required: false
         type: string
         default: ""
+      service:
+        description: "Upload service: storageto | pixeldrain"
+        required: false
+        type: choice
+        default: "storageto"
+        options:
+          - storageto
+          - pixeldrain
 
 jobs:
   upload:
@@ -19,6 +27,7 @@ jobs:
     timeout-minutes: 120
     env:
       STORAGE_TO_VISITOR_TOKEN: ${{ secrets.STORAGE_TO_VISITOR_TOKEN }}
+      PIXELDRAIN_TOKEN: ${{ secrets.PIXELDRAIN_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,16 +50,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          SERVICE_VAL="${{ inputs.service }}"
+          [ -z "$SERVICE_VAL" ] && SERVICE_VAL="storageto"
+          echo "Service: $SERVICE_VAL"
+
+          if [ "$SERVICE_VAL" = "pixeldrain" ] && [ -z "$PIXELDRAIN_TOKEN" ]; then
+            echo "::error::service=pixeldrain but PIXELDRAIN_TOKEN secret is not set"
+            exit 1
+          fi
+
           ARGS=( "${{ inputs.source }}" )
           if [ -n "${{ inputs.filename }}" ]; then ARGS+=( "${{ inputs.filename }}" ); fi
+          ARGS+=( "" )
+          ARGS+=( "$SERVICE_VAL" )
+
           OUT=$(node upload.mjs "${ARGS[@]}" 2>&1 | tee /dev/stderr)
           JSON=$(echo "$OUT" | sed -n '/RESULT_JSON_BEGIN/,/RESULT_JSON_END/p' | sed '1d;$d')
           echo "$JSON" > result.json
           URL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).main?.url||'')")
           RAW=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).main?.raw_url||'')")
+          SVC=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).main?.service||'$SERVICE_VAL')")
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "raw_url=$RAW" >> "$GITHUB_OUTPUT"
-          echo "::notice title=storage.to upload::$URL"
+          echo "service=$SVC" >> "$GITHUB_OUTPUT"
+          echo "::notice title=$SVC upload::$URL"
+          echo "::notice title=$SVC raw::$RAW"
 
       - name: Persist result
         if: always()

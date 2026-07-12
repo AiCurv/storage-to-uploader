@@ -28,14 +28,13 @@ export default async function handler(req, res) {
 
   // 2. Set bot commands menu
   const commands = [
-    { command: "upload", description: "Upload & convert video to MP4" },
-    { command: "raw", description: "Upload without conversion" },
-    { command: "info", description: "Get video info without uploading" },
+    { command: "upload", description: "Upload link (asks which service)" },
+    { command: "storage", description: "Upload directly to storage.to" },
+    { command: "pixeldrain", description: "Upload directly to pixeldrain" },
+    { command: "service", description: "Show / change default service" },
+    { command: "raw", description: "Same as /upload" },
     { command: "rename", description: "Set custom filename for next upload" },
-    { command: "subson", description: "Enable subtitle extraction" },
-    { command: "subsoff", description: "Disable subtitle extraction" },
     { command: "status", description: "Check current settings" },
-    { command: "channelid", description: "Get channel ID for auto-posting" },
     { command: "ping", description: "Check bot latency" },
     { command: "about", description: "About this bot" },
     { command: "help", description: "Detailed help & info" },
@@ -53,13 +52,13 @@ export default async function handler(req, res) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       description:
-        "🎬 StreamToBuffer Bot v2.0 — Send me any video link and I'll convert it to streamable MP4, extract subtitles, and upload to storage.to!\n\n" +
+        "🎬 StreamToBuffer Bot — Send me any file link and I'll upload it to storage.to OR pixeldrain!\n\n" +
         "✨ Features:\n" +
-        "• MKV/AVI/MOV/WebM → MP4 conversion\n" +
-        "• Subtitle extraction (SRT/ASS/VTT)\n" +
-        "• Streaming CDN link + HTML page\n" +
-        "• Auto-post to your channel\n" +
-        "• Supports files up to 5GB+\n\n" +
+        "• Pick service per upload (inline keyboard)\n" +
+        "• storage.to: anonymous, up to 25GB\n" +
+        "• pixeldrain: persistent, account-based\n" +
+        "• Direct download passthrough — no conversion\n" +
+        "• Forwarded Telegram files supported\n\n" +
         "Just send a URL to get started!",
     }),
   });
@@ -69,7 +68,7 @@ export default async function handler(req, res) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      short_description: "Video → MP4 converter & uploader with streaming links",
+      short_description: "File uploader — storage.to + pixeldrain",
     }),
   });
 
