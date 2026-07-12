@@ -1,9 +1,8 @@
-// Called by the GitHub Actions workflow when an upload finishes.
-// Body: { chat_id, url, raw_url, streaming_url, filename, size_bytes, human_size, subtitles, video_info, thumbnail, converted, ok, error }
-// We forward the result to the user via sendMessage and post to channel.
+// Called by GitHub Actions workflow when upload finishes.
+// Body: { chat_id, url, raw_url, filename, size_bytes, human_size, expires_at, error }
+// We send the storage.to link to the user. That's it. No file upload to Telegram.
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
-const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID || "";
 
 async function sendMessage(chatId, text, extra = {}) {
   await fetch(`${TELEGRAM_API}/sendMessage`, {
@@ -25,85 +24,6 @@ function humanSize(n) {
   let i = 0;
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
   return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
-}
-
-function formatDuration(seconds) {
-  if (!seconds) return "?";
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  if (h > 0) return `${h}h ${m}m ${s}s`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-}
-
-function buildResultMessage(body) {
-  const size = body.human_size || humanSize(body.size_bytes);
-  const lines = [
-    `✅ <b>Upload Complete!</b>`,
-    ``,
-    `🎬 <b>${body.filename}</b> (${size})`,
-  ];
-
-  // Show video info if available
-  if (body.video_info) {
-    const vi = body.video_info;
-    lines.push(`📐 ${vi.video_resolution || "?"} | ${vi.video_codec || "?"} | ${formatDuration(vi.duration)}`);
-    if (body.converted) {
-      lines.push(`🔄 Converted to MP4`);
-    }
-  }
-
-  lines.push("");
-  lines.push(`🔗 <a href="${body.url}">HTML Page</a> (stream + download + QR)`);
-
-  // Streaming CDN link — THIS is the link that plays in browser/VLC
-  if (body.streaming_url) {
-    lines.push(`▶️ <a href="${body.streaming_url}">Stream Direct</a> (play in browser/VLC)`);
-  }
-
-  // Add subtitle links if present
-  const subs = body.subtitles || [];
-  if (subs.length > 0) {
-    lines.push("");
-    lines.push(`📝 <b>Subtitles (${subs.length}):</b>`);
-    for (const sub of subs) {
-      const subLabel = sub.filename || "subtitle";
-      lines.push(`  • <a href="${sub.url}">${subLabel}</a>`);
-    }
-  }
-
-  // Expiry notice
-  if (body.expires_at) {
-    lines.push("");
-    lines.push(`⏰ Links expire: ${body.expires_at}`);
-  }
-
-  // Tip
-  lines.push("");
-  lines.push(`💡 Tip: "Stream Direct" link plays instantly. "HTML Page" has the full player + download button.`);
-
-  return lines.join("\n");
-}
-
-function buildChannelMessage(body) {
-  const size = body.human_size || humanSize(body.size_bytes);
-  const lines = [
-    `🎬 <b>${body.filename}</b> (${size})`,
-    ``,
-    `🔗 <a href="${body.url}">Stream</a> | <a href="${body.streaming_url || body.raw_url}">Direct</a>`,
-  ];
-
-  const subs = body.subtitles || [];
-  if (subs.length > 0) {
-    lines.push("");
-    lines.push(`📝 Subtitles:`);
-    for (const sub of subs) {
-      lines.push(`  • <a href="${sub.url}">${sub.filename || "subtitle"}</a>`);
-    }
-  }
-
-  return lines.join("\n");
 }
 
 export default async function handler(req, res) {
@@ -128,19 +48,19 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   }
 
-  // Send result to user
-  const userMsg = buildResultMessage(body);
-  await sendMessage(chatId, userMsg);
+  // Send the storage.to link to user
+  const size = body.human_size || humanSize(body.size_bytes);
+  const msg = [
+    `✅ <b>Upload Complete!</b>`,
+    ``,
+    `📦 <b>${body.filename}</b> (${size})`,
+    ``,
+    `🔗 <a href="${body.url}">Download Link</a>`,
+    ``,
+    body.expires_at ? `⏰ Expires: ${body.expires_at}` : "",
+  ].filter(Boolean).join("\n");
 
-  // Post to channel if configured (just a link message — the actual video upload happens from GitHub Actions)
-  if (CHANNEL_ID) {
-    try {
-      const channelMsg = buildChannelMessage(body);
-      await sendMessage(CHANNEL_ID, channelMsg);
-    } catch (err) {
-      console.error("[result] channel post failed:", err.message);
-    }
-  }
+  await sendMessage(chatId, msg);
 
   return res.status(200).json({ ok: true });
 }

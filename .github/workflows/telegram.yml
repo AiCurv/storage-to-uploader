@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       source:
-        description: "HTTP(S) URL to download and upload"
+        description: "HTTP(S) URL to download and upload to storage.to"
         required: true
         type: string
       filename:
@@ -14,11 +14,6 @@ on:
         required: false
         type: string
         default: ""
-      content_type:
-        description: "Override content type (optional)"
-        required: false
-        type: string
-        default: "application/octet-stream"
 
 jobs:
   upload:
@@ -29,9 +24,6 @@ jobs:
       VERCEL_CALLBACK_URL: ${{ secrets.VERCEL_CALLBACK_URL }}
       VERIFY_TOKEN: ${{ secrets.BOT_VERIFY_TOKEN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-      CONVERT_TO_MP4: "1"
-      EXTRACT_SUBS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,13 +44,7 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install FFmpeg
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-          ffmpeg -version | head -1
-
-      - name: Run upload
+      - name: Download and upload to storage.to
         env:
           EVENT_PAYLOAD: ${{ toJSON(github.event) }}
         shell: bash
@@ -66,17 +52,12 @@ jobs:
           set -euo pipefail
 
           echo "$EVENT_PAYLOAD" > /tmp/event.json
-          echo "::notice title=event dump::$(head -c 400 /tmp/event.json)"
 
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             SOURCE=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.source_url||"")}catch(_){process.stdout.write("")}')
             FILENAME=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.filename||"")}catch(_){process.stdout.write("")}')
             CHAT_ID_VAL=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.chat_id?String(p.chat_id):"")}catch(_){process.stdout.write("")}')
-            DO_CONVERT=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.convert_to_mp4||"1")}catch(_){process.stdout.write("1")}')
-            DO_EXTRACT=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.extract_subs||"1")}catch(_){process.stdout.write("1")}')
             CALLBACK_VAL="$VERCEL_CALLBACK_URL"
-            export CONVERT_TO_MP4="$DO_CONVERT"
-            export EXTRACT_SUBS="$DO_EXTRACT"
           else
             SOURCE="${{ inputs.source }}"
             FILENAME="${{ inputs.filename }}"
@@ -89,7 +70,7 @@ jobs:
           echo "chat_id=$CHAT_ID_VAL"
 
           if [ -z "$SOURCE" ]; then
-            echo "::error::No source URL provided in client_payload"
+            echo "::error::No source URL provided"
             if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
               ERR_PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" node -e 'console.log(JSON.stringify({chat_id:process.env.CHAT_ID_VAL,error:"empty source_url in dispatch payload"}))')
               curl -fsS -X POST "$CALLBACK_VAL" \
@@ -123,103 +104,30 @@ jobs:
 
           echo "$JSON" > result.json
 
-          # Parse the nested result format
+          # Parse result
           MAIN_URL=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.url||'')")
           MAIN_RAW=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.raw_url||'')")
-          MAIN_STREAM=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.streaming_url||'')")
           MAIN_FNAME=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.filename||'')")
           MAIN_SIZE=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(String(r.main?.size||0))")
           MAIN_HSIZE=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.human_size||'')")
-          SUBS_JSON=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(JSON.stringify(r.subtitles||[]))")
-          VIDEO_INFO=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(JSON.stringify(r.video_info||null))")
-          THUMB_JSON=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(JSON.stringify(r.thumbnail||null))")
-          WAS_CONVERTED=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(String(r.converted||false))")
+          MAIN_EXPIRES=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.expires_at||'')")
 
           echo "::notice title=storage.to HTML::$MAIN_URL"
           echo "::notice title=storage.to raw::$MAIN_RAW"
-          echo "::notice title=streaming CDN::$MAIN_STREAM"
-          echo "::notice title=subtitles::$SUBS_JSON"
-          echo "::notice title=converted::$WAS_CONVERTED"
-
-          # ── Upload MP4 to Telegram channel (bot as admin, up to 2GB) ──
-          if [ -n "$TELEGRAM_CHANNEL_ID" ] && [ -n "$MAIN_STREAM" ]; then
-            echo "Uploading video to Telegram channel..."
-            # Download the streaming MP4 to upload to Telegram
-            CHANNEL_DIR="/tmp/telegram_channel"
-            mkdir -p "$CHANNEL_DIR"
-            CHANNEL_FILE="$CHANNEL_DIR/${MAIN_FNAME}"
-
-            # Download the streaming URL for Telegram upload
-            set +e
-            curl -fSLo "$CHANNEL_FILE" "$MAIN_STREAM" 2>&1
-            DL_STATUS=$?
-            set -e
-
-            if [ $DL_STATUS -eq 0 ] && [ -f "$CHANNEL_FILE" ]; then
-              CHANNEL_SIZE=$(stat -c%s "$CHANNEL_FILE" 2>/dev/null || echo 0)
-              CHANNEL_SIZE_MB=$((CHANNEL_SIZE / 1024 / 1024))
-              echo "Downloaded for channel: ${CHANNEL_SIZE_MB} MB"
-
-              # Telegram limit: 50MB for bots, 2GB for bots as channel admin
-              if [ "$CHANNEL_SIZE_MB" -le 2000 ]; then
-                # Build caption
-                CAPTION=$(FNAME="$MAIN_FNAME" HSIZE="$MAIN_HSIZE" URL="$MAIN_URL" SUBS="$SUBS_JSON" node -e '
-                  const f=process.env.FNAME, h=process.env.HSIZE, u=process.env.URL;
-                  const subs = JSON.parse(process.env.SUBS||"[]");
-                  let cap = `🎬 ${f} (${h})\n\n🔗 Stream: ${u}`;
-                  if (subs.length > 0) {
-                    cap += "\n📝 Subs: " + subs.map(s => s.filename).join(", ");
-                  }
-                  process.stdout.write(cap.slice(0, 1024));
-                ')
-
-                # Upload using sendVideo (supports up to 2GB for admin bots in channels)
-                # Must use multipart/form-data with file upload
-                set +e
-                # Try sendVideo first (better for video files)
-                curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo" \
-                  -F "chat_id=${TELEGRAM_CHANNEL_ID}" \
-                  -F "video=@${CHANNEL_FILE}" \
-                  -F "caption=${CAPTION}" \
-                  -F "parse_mode=HTML" \
-                  -F "supports_streaming=true" \
-                  --max-time 1800 2>&1 || {
-                  echo "sendVideo failed, trying sendDocument as fallback..."
-                  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-                    -F "chat_id=${TELEGRAM_CHANNEL_ID}" \
-                    -F "document=@${CHANNEL_FILE}" \
-                    -F "caption=${CAPTION}" \
-                    -F "parse_mode=HTML" \
-                    --max-time 1800 2>&1 || true
-                }
-                set -e
-                echo "Telegram channel upload done"
-              else
-                echo "File too large for Telegram (${CHANNEL_SIZE_MB} MB > 2000 MB limit), skipping channel upload"
-              fi
-            else
-              echo "Failed to download file for Telegram channel upload, skipping"
-            fi
-
-            # Cleanup
-            rm -rf "$CHANNEL_DIR"
-          fi
+          echo "::notice title=filename::$MAIN_FNAME"
+          echo "::notice title=size::$MAIN_HSIZE"
 
           # ── Callback to Vercel bot with results ──
           if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
-            PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" URL="$MAIN_URL" RAW="$MAIN_RAW" STREAM="$MAIN_STREAM" FNAME="$MAIN_FNAME" SIZE="$MAIN_SIZE" HSIZE="$MAIN_HSIZE" SUBS="$SUBS_JSON" VIDEO_INFO="$VIDEO_INFO" THUMB="$THUMB_JSON" CONVERTED="$WAS_CONVERTED" node -e '
+            PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" URL="$MAIN_URL" RAW="$MAIN_RAW" FNAME="$MAIN_FNAME" SIZE="$MAIN_SIZE" HSIZE="$MAIN_HSIZE" EXPIRES="$MAIN_EXPIRES" node -e '
               const o = {
                 chat_id: process.env.CHAT_ID_VAL,
                 url: process.env.URL,
                 raw_url: process.env.RAW,
-                streaming_url: process.env.STREAM,
                 filename: process.env.FNAME,
                 size_bytes: Number(process.env.SIZE),
                 human_size: process.env.HSIZE,
-                subtitles: JSON.parse(process.env.SUBS||"[]"),
-                video_info: process.env.VIDEO_INFO !== "null" ? JSON.parse(process.env.VIDEO_INFO) : null,
-                thumbnail: process.env.THUMB !== "null" ? JSON.parse(process.env.THUMB) : null,
-                converted: process.env.CONVERTED === "true",
+                expires_at: process.env.EXPIRES,
               };
               process.stdout.write(JSON.stringify(o));
             ')
@@ -228,3 +136,6 @@ jobs:
               -H "X-Verify: $VERIFY_TOKEN" \
               -d "$PAYLOAD" || true
           fi
+
+          # Cleanup
+          rm -f result.json
