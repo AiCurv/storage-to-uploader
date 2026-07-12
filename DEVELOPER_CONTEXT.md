@@ -9,7 +9,7 @@
 ## Project Overview
 
 **Repository**: `AiCurv/storage-to-uploader`
-**Purpose**: A Telegram bot that downloads any file from a URL and uploads it to storage.to, then sends the download link back to the user.
+**Purpose**: A Telegram bot that downloads any file from a URL and uploads it to **storage.to** OR **pixeldrain**, then sends the download link back to the user.
 **Live Bot**: `@Streamtobufferbot` on Telegram
 **Vercel App**: `storage-to-uploader.vercel.app`
 
@@ -18,26 +18,28 @@
 ```
 User → Telegram Bot (@Streamtobufferbot)
   → Vercel webhook (/api/webhook) detects URL or forwarded file
-  → Triggers GitHub Actions via repository_dispatch
+  → Shows inline keyboard [📦 Storage.to] [🎬 PixelDrain] for URL uploads
+       (or user uses /storage <url> / /pixeldrain <url> for direct upload)
+  → Triggers GitHub Actions via repository_dispatch with {source_url, filename, chat_id, service}
   → GitHub Actions runs upload.mjs:
      1. Downloads file from URL (curl)
-     2. Uploads to storage.to (multipart for >50MB)
-     3. Gets storage.to HTML link
-  → GitHub Actions calls Vercel /api/result with the link
-  → Vercel sends the storage.to link to user via Telegram
+     2. Uploads to storage.to (multipart for >50MB) OR pixeldrain (single PUT)
+     3. Gets HTML link + raw download link
+  → GitHub Actions calls Vercel /api/result with {service, url, raw_url, ...}
+  → Vercel sends the link to user via Telegram
 ```
 
 ## Key Components
 
 | File | Purpose |
 |------|---------|
-| `upload.mjs` | Main upload script — downloads file, uploads to storage.to, outputs JSON result |
-| `bot/api/webhook.js` | Vercel serverless — handles Telegram messages, detects URLs and forwarded files |
-| `bot/api/result.js` | Vercel serverless — receives upload result from GitHub Actions, sends link to user |
-| `bot/api/start.js` | Vercel serverless — health check endpoint |
+| `upload.mjs` | Main upload script — downloads file, uploads to storage.to OR pixeldrain, outputs JSON result. 4th CLI arg = service. |
+| `bot/api/webhook.js` | Vercel serverless — handles Telegram messages, shows service picker for URLs, dispatches GitHub Actions with service in payload |
+| `bot/api/result.js` | Vercel serverless — receives upload result from GitHub Actions, sends link to user (shows service label + raw download link) |
+| `bot/api/start.js` | Vercel serverless — health check endpoint, registers webhook & bot commands |
 | `bot/vercel.json` | Vercel routing config |
-| `.github/workflows/telegram.yml` | GitHub Actions workflow triggered by repository_dispatch from webhook |
-| `.github/workflows/upload.yml` | GitHub Actions workflow triggered manually (workflow_dispatch) |
+| `.github/workflows/telegram.yml` | GitHub Actions workflow triggered by repository_dispatch from webhook (extracts service from client_payload) |
+| `.github/workflows/upload.yml` | GitHub Actions workflow triggered manually (workflow_dispatch) with service input |
 
 ## API Details
 
@@ -54,6 +56,22 @@ User → Telegram Bot (@Streamtobufferbot)
 - **Key URLs**: `file.url` = HTML page, `file.raw_url` = direct download
 - **Visitor token**: `X-Visitor-Token` header for tracking ownership
 - **Docs**: https://storage.to/llms.txt
+
+### pixeldrain API
+- **Base**: `https://pixeldrain.com/api`
+- **Auth REQUIRED**: HTTP Basic Auth, empty username, API key as password
+  - Header: `Authorization: Basic base64(":" + api_key)`
+  - Token stored in `PIXELDRAIN_TOKEN` GitHub secret (Vercel does NOT need it)
+- **Max file size**: depends on user plan (test file was 2.5 GB, worked fine)
+- **Upload flow** (single PUT, no multipart):
+  1. `PUT /api/file/{url_encoded_filename}` with raw body (streamed from disk)
+  2. Returns: `{ success: true, id, name, size, ... }`
+- **Key URLs** (constructed from returned `id`):
+  - View page: `https://pixeldrain.com/u/{id}`
+  - Raw download: `https://pixeldrain.com/api/file/{id}`
+- **Files do NOT expire** (unlike storage.to's 3-day default)
+- **Docs**: https://pixeldrain.com/api
+- **Important**: pixeldrain `/u/<id>` and `/d/<id>` return HTML, use `/api/file/<id>` for raw bytes (already handled in `resolveSource()` for downloads FROM pixeldrain)
 
 ### Telegram Bot API
 - Bot token in Vercel env (`TELEGRAM_BOT_TOKEN`) and GitHub secrets
@@ -110,20 +128,25 @@ User → Telegram Bot (@Streamtobufferbot)
 ## Environment Variables & Secrets
 
 ### Vercel Env
-- `TELEGRAM_BOT_TOKEN` — Bot token
+- `TELEGRAM_BOT_TOKEN` — Bot token (current: token for @Streamtobufferbot, id 8902303668)
 - `TELEGRAM_ALLOWED_ID` — User chat ID (6404893345) — hard-locks bot to this user
-- `BOT_VERIFY_TOKEN` — Shared secret for GitHub Actions → Vercel callback
+- `BOT_VERIFY_TOKEN` — Shared secret for GitHub Actions → Vercel callback (`787010dec8c8821b808e519f15c5d016b263640d59e06e68116ae5d9b32c5ef5`)
 - `GH_TOKEN` — GitHub token for triggering dispatches
 - `GITHUB_REPO` — "AiCurv/storage-to-uploader"
 - `STORAGE_TO_VISITOR_TOKEN` — Token for storage.to upload ownership
+- `SETUP_SECRET` — Required to call /api/start endpoint (re-registers webhook)
+- `VERCEL_PROJECT_URL` — `storage-to-uploader.vercel.app`
+- `TELEGRAM_CHANNEL_ID` — `-1003990524943` (curvstorage channel, currently unused)
 
 ### GitHub Secrets
 - `TELEGRAM_BOT_TOKEN` — Same as Vercel
 - `BOT_VERIFY_TOKEN` — Must match Vercel's exactly (64 hex chars)
 - `VERCEL_CALLBACK_URL` — `https://storage-to-uploader.vercel.app/api/result`
 - `STORAGE_TO_VISITOR_TOKEN` — Same as Vercel
+- `PIXELDRAIN_TOKEN` — API key for pixeldrain uploads (HTTP Basic Auth, empty username)
 - `TELEGRAM_CHANNEL_ID` — `-1003990524943` (curvstorage channel)
 - `TELEGRAM_ALLOWED_ID` — `6404893345`
+- `GH_TOKEN` — Same as Vercel
 
 ## Multipart Upload Optimization
 
@@ -150,17 +173,45 @@ When a user forwards a file (document, video, audio, photo) to the bot:
 | Command | Description |
 |---------|-------------|
 | `/start` | Welcome message + main menu |
-| `/upload <url>` | Upload link to storage.to |
+| `/upload <url>` | Show service picker (inline keyboard) for URL upload |
+| `/storage <url>` | Upload directly to storage.to (skip picker) |
+| `/pixeldrain <url>` | Upload directly to pixeldrain (skip picker) |
+| `/service` | Show / change default service (inline keyboard) |
 | `/raw <url>` | Same as /upload (kept for compatibility) |
 | `/rename <name>` | Set custom filename for next upload |
-| `/status` | Current settings |
+| `/status` | Current settings (shows default service + next filename) |
 | `/ping` | Latency check |
 | `/help` | Detailed help |
 | `/about` | About the bot |
 
-URLs sent as plain text are auto-detected and uploaded without needing a command.
+URLs sent as plain text auto-trigger the service picker (inline keyboard with both service buttons + Cancel).
+Forwarded files also show the service picker.
 
 ## Update Log
+
+### v6.0 (2026-07-12)
+- **Added pixeldrain as second upload service** (user-selectable per upload)
+- `upload.mjs`: 4th CLI arg = `service` (`storageto` | `pixeldrain`, default `storageto`)
+  - New `uploadToPixeldrain()` using `PUT /api/file/{name}` with HTTP Basic Auth (empty username, API key as password)
+  - Single PUT request (no multipart), streams file from disk
+  - Returns `{ service, url: "https://pixeldrain.com/u/{id}", raw_url: "https://pixeldrain.com/api/file/{id}", ... }`
+  - Retries on 5xx and 429 (max 3 attempts, exponential backoff)
+- `bot/api/webhook.js`: per-upload service picker via inline keyboard
+  - URL detection → inline keyboard [📦 Storage.to] [🎬 PixelDrain] [❌ Cancel]
+  - New commands: `/storage <url>`, `/pixeldrain <url>` (skip picker, direct upload)
+  - New command: `/service [storageto|pixeldrain]` — show/change default service
+  - Per-user `defaultService` setting (in-memory, default `storageto`)
+  - Pending-id bridge: long URLs stored in memory with short ID; callback_data is `pick_svc:<shortId>:<service>` (Telegram 64-byte callback_data limit)
+  - Forwarded files also show service picker
+  - Service propagated in dispatch payload: `client_payload.service`
+- `bot/api/result.js`: shows service label + raw download link in success message
+  - For pixeldrain: shows "♾️ Pixeldrain files do not expire" instead of expiry
+- `.github/workflows/telegram.yml`: extracts `service` from `client_payload`, validates `PIXELDRAIN_TOKEN` for pixeldrain uploads, includes service in Vercel callback payload
+- `.github/workflows/upload.yml`: manual workflow now supports `service` choice input
+- `bot/api/start.js`: updated bot command menu (upload/storage/pixeldrain/service) and descriptions
+- New GitHub secret: `PIXELDRAIN_TOKEN`
+- New persistent keyboard button: "🔄 Service"
+- **TESTED SUCCESSFULLY (full end-to-end)**: 2.55 GB MKV from Google video URL → pixeldrain.com/u/JvK4GxSs in 4 min 19 sec (download 62s + upload 56s)
 
 ### v5.0 (2026-07-12)
 - Stripped ALL FFmpeg, conversion, subtitle extraction, thumbnail generation
