@@ -89,26 +89,36 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
     const partSize = init.part_size;
     const totalParts = init.total_parts;
     const completedParts = [];
-    for (let i = 0; i < totalParts; i++) {
-      const partNumber = i + 1;
-      let partUrl = init.initial_urls[String(partNumber)];
-      if (!partUrl) {
+    const CONCURRENCY = 3; // Upload 3 parts concurrently for speed
+
+    // Prefetch all part URLs in batches of 50
+    // The init response gives us the first batch (in initial_urls)
+    // We need to fetch the rest via /upload/parts
+    log(`prefetching part URLs for ${totalParts} parts...`);
+    const allPartNumbers = Array.from({ length: totalParts }, (_, k) => k + 1);
+    for (let batch = 0; batch < totalParts; batch += 50) {
+      const batchNums = allPartNumbers.slice(batch, batch + 50);
+      // Skip parts we already have URLs for (from init.initial_urls)
+      const missing = batchNums.filter(n => !init.initial_urls[String(n)]);
+      if (missing.length > 0) {
         const more = await api("/upload/parts", {
           upload_id: init.upload_id,
-          part_numbers: Array.from({ length: Math.min(totalParts - i, 50) }, (_, k) => i + k + 1),
+          part_numbers: missing,
         });
-        // API returns { success: true, urls: { "51": "https://...", "52": "..." } }
         const urlMap = more.urls || {};
         for (const [num, url] of Object.entries(urlMap)) {
           init.initial_urls[num] = url;
         }
-        partUrl = init.initial_urls[String(partNumber)];
       }
-      const start = i * partSize;
-      const end = Math.min(start + partSize, fileSize) - 1; // createReadStream end is inclusive
-      log(`part ${partNumber}/${totalParts}: bytes ${start}-${end + 1}`);
-      // Use createReadStream with start/end to avoid ERR_FS_FILE_TOO_LARGE for files >2GB
-      // readFileSync allocates a buffer for the full file size even with start/end
+    }
+    log(`all ${totalParts} part URLs fetched`);
+
+    // Upload parts with concurrency
+    async function uploadPart(partNumber) {
+      const partUrl = init.initial_urls[String(partNumber)];
+      if (!partUrl) throw new Error(`no URL for part ${partNumber}`);
+      const start = (partNumber - 1) * partSize;
+      const end = Math.min(start + partSize, fileSize) - 1;
       const partStream = createReadStream(filePath, { start, end, highWaterMark: 1024 * 1024 });
       const pr = await fetch(partUrl, {
         method: "PUT",
@@ -119,9 +129,23 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
       if (!pr.ok) throw new Error(`R2 part ${partNumber} PUT ${pr.status}: ${await pr.text()}`);
       const etag = pr.headers.get("etag") || pr.headers.get("ETag");
       if (!etag) throw new Error(`R2 part ${partNumber} missing etag header`);
-      completedParts.push({ partNumber, etag });
-      log(`part ${partNumber}/${totalParts} done (etag: ${etag})`);
+      return { partNumber, etag };
     }
+
+    // Process in batches of CONCURRENCY
+    for (let batch = 0; batch < totalParts; batch += CONCURRENCY) {
+      const batchPartNums = allPartNumbers.slice(batch, batch + CONCURRENCY);
+      const batchResults = await Promise.all(batchPartNums.map(n => uploadPart(n)));
+      completedParts.push(...batchResults);
+      const lastDone = batch + batchPartNums.length;
+      if (lastDone % 30 === 0 || lastDone === totalParts) {
+        log(`uploaded ${lastDone}/${totalParts} parts`);
+      }
+    }
+
+    // Sort by part number for the complete-multipart call
+    completedParts.sort((a, b) => a.partNumber - b.partNumber);
+
     log("complete-multipart");
     await api("/upload/complete-multipart", {
       upload_id: init.upload_id,
