@@ -180,6 +180,13 @@ async function uploadFileFromDisk(filePath, filename, contentType) {
 // ─── URL resolvers ───────────────────────────────────────────────
 
 function resolveSource(rawUrl) {
+  // Telegram file: tgfile:<file_id>:<filename>
+  // This is a virtual URL that means "download from Telegram Bot API"
+  // Handled separately in main(), not via curl
+  if (rawUrl.startsWith("tgfile:")) {
+    return { url: rawUrl, headers: {}, isTelegramFile: true };
+  }
+
   const u = new URL(rawUrl);
   const host = u.hostname.toLowerCase();
 
@@ -194,6 +201,63 @@ function resolveSource(rawUrl) {
 
   // Default: pass-through with browser UA
   return { url: rawUrl, headers: { "User-Agent": UA } };
+}
+
+/**
+ * Download a file from Telegram Bot API using file_id.
+ * Returns { filePath, fileName, contentType }
+ * Note: Telegram Bot API has a 20MB download limit for getFile.
+ */
+async function downloadTelegramFile(fileId, fileName) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (!botToken) throw new Error("TELEGRAM_BOT_TOKEN not set, can't download Telegram file");
+
+  log(`downloading Telegram file: file_id=${fileId} name=${fileName}`);
+
+  // Step 1: Get file path via getFile API
+  const fileRes = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
+  const fileData = await fileRes.json();
+  if (!fileData.ok) throw new Error(`Telegram getFile failed: ${fileData.description}`);
+
+  const filePath = fileData.result.file_path;
+  const fileSize = fileData.result.file_size;
+  log(`Telegram file_path: ${filePath} size: ${fileSize || "unknown"}`);
+
+  // Step 2: Download the file
+  const dlUrl = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
+  const ext = extname(filePath || fileName).toLowerCase() || ".bin";
+  const localPath = join(WORK_DIR, "download" + ext);
+
+  // Use curl for reliability
+  const curlCmd = `curl -fSL --retry 3 --retry-delay 5 -o "${localPath}" "${dlUrl}"`;
+  log("downloading with curl...");
+  try {
+    execSync(curlCmd, { stdio: ["pipe", "pipe", "pipe"], timeout: 300_000 }); // 5 min
+  } catch {
+    log("curl failed, trying fetch...");
+    const dlResponse = await fetch(dlUrl);
+    if (!dlResponse.ok) throw new Error(`Telegram file download failed: ${dlResponse.status}`);
+    const buf = Buffer.from(await dlResponse.arrayBuffer());
+    writeFileSync(localPath, buf);
+  }
+
+  const dlSize = statSync(localPath).size;
+  log(`Telegram download complete: ${dlSize} bytes (${(dlSize / 1024 / 1024).toFixed(1)} MB)`);
+
+  // Guess content type from extension
+  const ctMap = {
+    ".mp4": "video/mp4", ".mkv": "video/matroska", ".avi": "video/x-msvideo",
+    ".mov": "video/quicktime", ".webm": "video/webm",
+    ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".wav": "audio/wav", ".flac": "audio/flac",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".zip": "application/zip", ".rar": "application/x-rar-compressed",
+    ".7z": "application/x-7z-compressed", ".tar": "application/x-tar", ".gz": "application/gzip",
+    ".pdf": "application/pdf", ".apk": "application/vnd.android.package-archive",
+  };
+  const contentType = ctMap[ext] || "application/octet-stream";
+
+  return { filePath: localPath, fileName: fileName || basename(filePath) || "file", contentType };
 }
 
 function guessFilename(url, contentDisposition) {
@@ -221,7 +285,29 @@ async function main() {
   // Create work directory
   mkdirSync(WORK_DIR, { recursive: true });
 
-  const { url: resolvedUrl, headers: downloadHeaders } = resolveSource(srcArg);
+  const resolved = resolveSource(srcArg);
+
+  // ── Handle Telegram forwarded files ──
+  if (resolved.isTelegramFile) {
+    const parts = srcArg.split(":");
+    // tgfile:<file_id>:<filename>
+    const fileId = parts.slice(1, -1).join(":"); // file_id might contain colons? No, but be safe
+    const tgFileName = parts[parts.length - 1] || "file";
+    
+    const tgResult = await downloadTelegramFile(fileId, decodeURIComponent(tgFileName));
+    const workName = overrideName || tgResult.fileName;
+    const contentType = overrideType || tgResult.contentType;
+
+    const mainResult = await uploadFileFromDisk(tgResult.filePath, workName, contentType);
+    
+    try { rmSync(WORK_DIR, { recursive: true, force: true }); } catch {}
+    
+    const output = { main: mainResult };
+    process.stdout.write("RESULT_JSON_BEGIN\n" + JSON.stringify(output, null, 2) + "\nRESULT_JSON_END\n");
+    return;
+  }
+
+  const { url: resolvedUrl, headers: downloadHeaders } = resolved;
 
   // ── Step 1: Download file to disk using curl ──
   log("downloading source:", resolvedUrl);
