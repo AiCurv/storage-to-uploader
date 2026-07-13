@@ -3,8 +3,8 @@
   "buildCommand": null,
   "outputDirectory": "api",
   "functions": {
-    "api/webhook.js": { "maxDuration": 10 },
-    "api/start.js": { "maxDuration": 10 },
+    "api/webhook.js": { "maxDuration": 60 },
+    "api/start.js": { "maxDuration": 30 },
     "api/result.js": { "maxDuration": 10 }
   }
 }

@@ -6,6 +6,7 @@
 //   /raw <url>          - Same as /upload (kept for compatibility)
 //   /storage <url>      - Upload directly to storage.to (skip service picker)
 //   /pixeldrain <url>   - Upload directly to pixeldrain (skip service picker)
+//   /stream <url>       - Instant CDN Stream via Gcore (no download, returns streamable URL)
 //   /service            - Show / change default service
 //   /status             - Current settings (shows default service)
 //   /rename <name>      - Set custom filename for next upload
@@ -15,6 +16,8 @@
 //
 // Any direct URL sent as text triggers the service picker (inline keyboard).
 // Forwarded files (documents, videos, audio, photos) will be detected and prompted.
+
+import { provisionStreamableUrl } from "./_gcore.js";
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
 
@@ -26,16 +29,15 @@ const SERVICES = {
 const WELCOME = [
   "📦 <b>StreamToBuffer Bot</b>",
   "",
-  "Send me any download link and I'll:",
-  "  1️⃣ Ask which service to upload to",
-  "  2️⃣ Download the file via GitHub Actions",
-  "  3️⃣ Upload to <b>storage.to</b> or <b>pixeldrain</b>",
-  "  4️⃣ Send you the download link",
+  "Send me any download link and I'll either:",
+  "  📦 <b>Upload</b> it to storage.to / pixeldrain (via GitHub Actions), or",
+  "  🚀 <b>Stream</b> it instantly via Gcore CDN (no download, no upload — instant streamable URL)",
   "",
   "📝 <b>Commands:</b>",
   "/upload &lt;url&gt; — Upload link (asks which service)",
   "/storage &lt;url&gt; — Upload directly to storage.to",
   "/pixeldrain &lt;url&gt; — Upload directly to pixeldrain",
+  "/stream &lt;url&gt; — 🚀 Instant CDN stream (Gcore)",
   "/service — Show / change default service",
   "/rename &lt;name&gt; — Set custom filename",
   "/status — Current settings",
@@ -49,10 +51,16 @@ const WELCOME = [
 const HELP_MSG = [
   "📖 <b>StreamToBuffer Help</b>",
   "",
-  "<b>How it works:</b>",
-  "You send a download URL → I ask which service → GitHub Actions downloads + uploads → I send you the link.",
+  "<b>Two ways to use a link:</b>",
   "",
-  "<b>Two upload services:</b>",
+  "🚀 <b>Instant CDN Stream</b> (NEW — recommended for video):",
+  "• <b>/stream &lt;url&gt;</b> — returns an instant streamable URL via Gcore CDN",
+  "• No download/upload — Gcore edge pulls from origin on-the-fly",
+  "• Supports Range/seek (slice engine enabled)",
+  "• Streams 12GB+ MKV/MP4 in VLC, Stremio, TV players",
+  "• Works with pixeldrain, storage.to, any direct download link",
+  "",
+  "📦 <b>Upload services</b> (download + re-host):",
   "• <b>storage.to</b> — anonymous, files expire after some time, max 25GB",
   "• <b>pixeldrain</b> — requires account API key, files don't expire, max depends on plan",
   "",
@@ -68,6 +76,7 @@ const HELP_MSG = [
   "• Note: Telegram Bot API has a 20MB download limit for getFile",
   "",
   "<b>Commands:</b>",
+  "/stream <url> — 🚀 Instant CDN stream (Gcore)",
   "/upload <url> — Upload a link (asks which service)",
   "/storage <url> — Upload directly to storage.to",
   "/pixeldrain <url> — Upload directly to pixeldrain",
@@ -82,15 +91,17 @@ const HELP_MSG = [
 const ABOUT_MSG = [
   "🤖 <b>StreamToBuffer Bot</b>",
   "",
-  "Downloads any file link and uploads to storage.to OR pixeldrain for sharing.",
+  "Two modes: instant CDN streaming via Gcore, or download+re-host via GitHub Actions.",
   "",
   "🔧 <b>Tech Stack:</b>",
-  "• GitHub Actions (download + upload)",
+  "• Gcore CDN (instant streaming — slice engine, Range support, 200+ PoPs)",
+  "• GitHub Actions (download + upload for storage.to / pixeldrain)",
   "• storage.to (file hosting, up to 25GB, anonymous)",
   "• pixeldrain (file hosting, persistent, account-based)",
-  "• Vercel (bot webhook handler)",
+  "• Vercel (bot webhook handler + Gcore API orchestrator)",
   "",
   "⚡ <b>Features:</b>",
+  "• 🚀 Instant CDN stream — no download, no upload, no storage used",
   "• Direct download passthrough — no conversion",
   "• Choose service per upload (inline keyboard)",
   "• Files up to 25GB supported (storage.to)",
@@ -169,7 +180,7 @@ function mainMenu() {
   return {
     reply_markup: {
       keyboard: [
-        [{ text: "🔗 Upload link" }, { text: "🔄 Service" }],
+        [{ text: "🚀 Stream" }, { text: "🔗 Upload link" }, { text: "🔄 Service" }],
         [{ text: "/status" }, { text: "/help" }, { text: "/ping" }],
       ],
       resize_keyboard: true,
@@ -260,6 +271,51 @@ function logDispatch(stage, data) {
   } catch {}
 }
 
+// ─── Instant CDN Stream (Gcore) ──────────────────────────────────────────────
+
+async function handleStreamRequest(chatId, sourceUrl) {
+  if (!looksLikeUrl(sourceUrl)) {
+    await sendMessage(chatId, "❌ Provide a valid URL.\nExample: <code>/stream https://pixeldrain.com/api/file/abc</code>", mainMenu());
+    return;
+  }
+  // Normalize PixelDrain /u/<id> and /d/<id> to /api/file/<id> so the origin serves raw bytes
+  const normalized = normalizeSourceUrl(sourceUrl) || sourceUrl;
+  await sendMessage(chatId,
+    "🚀 <b>Instant CDN Stream</b>\n" +
+    "⏳ Provisioning Gcore edge route... (5-10s)",
+    mainMenu());
+  try {
+    const r = await provisionStreamableUrl(normalized);
+    const lines = [
+      "🚀 <b>Stream ready!</b>",
+      "",
+      `🔗 <a href="${r.streamUrl}">${r.streamUrl}</a>`,
+      "",
+      `📡 Origin: <code>${r.originHost}</code>`,
+      `🌐 Gcore edge: <code>${r.cname}</code>`,
+      `🆔 Resource: <code>${r.resourceId}</code>`,
+      r.groupCreated ? `✨ Origin group created (<code>${r.groupId}</code>)` : `♻️ Reused origin group (<code>${r.groupId}</code>)`,
+      "",
+      "<b>How to use:</b>",
+      "• Paste the URL into VLC / Stremio / your TV's media player",
+      "• Seek works (slice engine enabled)",
+      "• Gcore pulls from origin on-the-fly — no download, no upload",
+      "• First byte may take ~2-5s (cache warm-up), then full speed",
+    ];
+    await sendMessage(chatId, lines.join("\n"), mainMenu());
+  } catch (err) {
+    console.error("[stream] error:", err.message, err.body || "");
+    const msg = err.message || "unknown error";
+    let hint = "";
+    if (msg.includes("GCORE_")) {
+      hint = "\n\n💡 Tip: ask the bot admin to set GCORE_API_TOKEN, GCORE_CDN_RESOURCE_ID, GCORE_CDN_CNAME in Vercel env.";
+    } else if (msg.includes("CDN service is stopped") || msg.includes("permission")) {
+      hint = "\n\n💡 Tip: Gcore CDN service must be activated in the portal first (https://portal.gcore.com/cdn/resources/list).";
+    }
+    await sendMessage(chatId, `❌ <b>Stream failed:</b>\n<code>${msg.slice(0, 400)}</code>${hint}`, mainMenu());
+  }
+}
+
 function extractUrlFromText(text) {
   const m = text.match(/https?:\/\/\S+/i);
   return m ? m[0] : null;
@@ -342,12 +398,15 @@ function formatFileSize(bytes) {
 }
 
 // ─── Service picker keyboard ───────────────────────────────────
-// Returns inline keyboard with both services. Uses pending-id so callback_data stays short.
+// Returns inline keyboard with all options. Uses pending-id so callback_data stays short.
 function servicePickerKeyboard(pendingId, currentService) {
   const storagetoLabel  = currentService === "storageto"  ? "✅ 📦 Storage.to" : "📦 Storage.to";
   const pixeldrainLabel = currentService === "pixeldrain" ? "✅ 🎬 PixelDrain" : "🎬 PixelDrain";
   return {
     inline_keyboard: [
+      [
+        { text: "🚀 Stream (instant CDN)", callback_data: `pick_stream:${pendingId}` },
+      ],
       [
         { text: storagetoLabel,  callback_data: `pick_svc:${pendingId}:storageto` },
         { text: pixeldrainLabel, callback_data: `pick_svc:${pendingId}:pixeldrain` },
@@ -389,6 +448,20 @@ export default async function handler(req, res) {
     const cb = update.callback_query;
     const data = cb.data || "";
     const chatId = String(cb.message?.chat?.id || cb.from?.id || "");
+
+    // Stream button picked — instant Gcore CDN stream, no download
+    if (data.startsWith("pick_stream:")) {
+      const [, pendingId] = data.split(":");
+      const pending = takePendingUpload(pendingId);
+      if (!pending) {
+        await answerCallbackQuery(cb.id, "⚠️ Session expired. Please send the URL again.");
+        return res.status(200).json({ ok: true });
+      }
+      await answerCallbackQuery(cb.id, "🚀 Provisioning Gcore stream...");
+      // Run the stream flow (sends its own messages to chat)
+      await handleStreamRequest(chatId, pending.url);
+      return res.status(200).json({ ok: true });
+    }
 
     // Service picked for an upload (pending id present)
     if (data.startsWith("pick_svc:")) {
@@ -748,11 +821,47 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   }
 
+  // ─── Command: /stream <url> ─── (instant Gcore CDN stream, no download)
+  if (cleanText.startsWith("/stream ")) {
+    const urlPart = cleanText.replace(/^\/stream\s+/, "").trim();
+    await handleStreamRequest(chatId, urlPart);
+    return res.status(200).json({ ok: true });
+  }
+
+  // ─── Command: /stream (no args) ─── show help
+  if (cleanText === "/stream") {
+    await sendMessage(
+      chatId,
+      "🚀 <b>Instant CDN Stream</b>\n\n" +
+      "Usage: <code>/stream &lt;url&gt;</code>\n\n" +
+      "Example: <code>/stream https://pixeldrain.com/api/file/Kd4Xvyan?download</code>\n\n" +
+      "I'll give you back a fast Gcore CDN URL you can stream in VLC / Stremio / TV.\n" +
+      "No download, no upload — Gcore edge pulls from origin on-the-fly.",
+      mainMenu()
+    );
+    return res.status(200).json({ ok: true });
+  }
+
+  // ─── Menu button: "🚀 Stream" ───
+  if (text === "🚀 Stream") {
+    await sendMessage(
+      chatId,
+      "🚀 <b>Instant CDN Stream</b>\n\n" +
+      "Paste any video download link and I'll give you back a fast Gcore CDN URL you can stream in VLC / TV.\n\n" +
+      "<b>Or use the command directly:</b>\n" +
+      "<code>/stream https://pixeldrain.com/api/file/abc</code>\n\n" +
+      "💡 No download, no upload — Gcore edge pulls from origin on-the-fly. Seek works.",
+      mainMenu()
+    );
+    return res.status(200).json({ ok: true });
+  }
+
   // ─── Menu button: "🔗 Upload link" ───
   if (text === "🔗 Upload link") {
     await sendMessage(
       chatId,
       "📎 Paste your download link below, or use:\n" +
+      "<code>/stream URL</code> — 🚀 instant CDN stream (recommended for video)\n" +
       "<code>/upload URL</code> — pick service via inline button\n" +
       "<code>/storage URL</code> — upload to storage.to directly\n" +
       "<code>/pixeldrain URL</code> — upload to pixeldrain directly\n" +

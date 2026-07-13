@@ -9,7 +9,7 @@
 ## Project Overview
 
 **Repository**: `AiCurv/storage-to-uploader`
-**Purpose**: A Telegram bot that downloads any file from a URL and uploads it to **storage.to** OR **pixeldrain**, then sends the download link back to the user.
+**Purpose**: A Telegram bot that takes any file URL and either (🚀) returns an instant streamable Gcore CDN URL (no download, no upload), or (📦) downloads + re-uploads it to **storage.to** OR **pixeldrain** and sends the download link back to the user.
 **Live Bot**: `@Streamtobufferbot` on Telegram
 **Vercel App**: `storage-to-uploader.vercel.app`
 
@@ -18,15 +18,27 @@
 ```
 User → Telegram Bot (@Streamtobufferbot)
   → Vercel webhook (/api/webhook) detects URL or forwarded file
-  → Shows inline keyboard [📦 Storage.to] [🎬 PixelDrain] for URL uploads
+  
+  Two paths from a URL:
+  
+  🚀 PATH A: Instant CDN Stream (/stream or 🚀 Stream button)
+     → Vercel calls Gcore API directly:
+        1. find-or-create origin group for the URL's host
+        2. PATCH the pre-created CDN resource (slice, hostHeader, cors, etc.)
+        3. purge cache
+     → Vercel replies with streamable URL: https://<cname>/<path>?<query>
+     → User streams via Gcore edge (VLC, Stremio, TV) — payload never touches Vercel
+  
+  📦 PATH B: Upload (existing flow)
+     → Show inline keyboard [📦 Storage.to] [🎬 PixelDrain] [❌ Cancel]
        (or user uses /storage <url> / /pixeldrain <url> for direct upload)
-  → Triggers GitHub Actions via repository_dispatch with {source_url, filename, chat_id, service}
-  → GitHub Actions runs upload.mjs:
-     1. Downloads file from URL (curl)
-     2. Uploads to storage.to (multipart for >50MB) OR pixeldrain (single PUT)
-     3. Gets HTML link + raw download link
-  → GitHub Actions calls Vercel /api/result with {service, url, raw_url, ...}
-  → Vercel sends the link to user via Telegram
+     → Triggers GitHub Actions via repository_dispatch with {source_url, filename, chat_id, service}
+     → GitHub Actions runs upload.mjs:
+        1. Downloads file from URL (curl)
+        2. Uploads to storage.to (multipart for >50MB) OR pixeldrain (single PUT)
+        3. Gets HTML link + raw download link
+     → GitHub Actions calls Vercel /api/result with {service, url, raw_url, ...}
+     → Vercel sends the link to user via Telegram
 ```
 
 ## Key Components
@@ -34,10 +46,11 @@ User → Telegram Bot (@Streamtobufferbot)
 | File | Purpose |
 |------|---------|
 | `upload.mjs` | Main upload script — downloads file, uploads to storage.to OR pixeldrain, outputs JSON result. 4th CLI arg = service. |
-| `bot/api/webhook.js` | Vercel serverless — handles Telegram messages, shows service picker for URLs, dispatches GitHub Actions with service in payload |
+| `bot/api/webhook.js` | Vercel serverless — handles Telegram messages, shows service picker for URLs, dispatches GitHub Actions with service in payload, handles /stream command |
+| `bot/api/_gcore.js` | Gcore API client — list/create origin groups, update CDN resource, purge cache. Exported: `provisionStreamableUrl(url)`, `gcoreStatus()` |
 | `bot/api/result.js` | Vercel serverless — receives upload result from GitHub Actions, sends link to user (shows service label + raw download link) |
 | `bot/api/start.js` | Vercel serverless — health check endpoint, registers webhook & bot commands |
-| `bot/vercel.json` | Vercel routing config |
+| `bot/vercel.json` | Vercel routing config — webhook `maxDuration: 60s` for Gcore API calls |
 | `.github/workflows/telegram.yml` | GitHub Actions workflow triggered by repository_dispatch from webhook (extracts service from client_payload) |
 | `.github/workflows/upload.yml` | GitHub Actions workflow triggered manually (workflow_dispatch) with service input |
 
@@ -137,6 +150,9 @@ User → Telegram Bot (@Streamtobufferbot)
 - `SETUP_SECRET` — Required to call /api/start endpoint (re-registers webhook)
 - `VERCEL_PROJECT_URL` — `storage-to-uploader.vercel.app`
 - `TELEGRAM_CHANNEL_ID` — `-1003990524943` (curvstorage channel, currently unused)
+- `GCORE_API_TOKEN` — Permanent Gcore API token (Authorization: APIKey <token>). Used by /stream.
+- `GCORE_CDN_RESOURCE_ID` — Numeric ID of the pre-created CDN resource (from portal URL)
+- `GCORE_CDN_CNAME` — The custom domain (cname) on the pre-created CDN resource (e.g. `stream.yourdomain.com`)
 
 ### GitHub Secrets
 - `TELEGRAM_BOT_TOKEN` — Same as Vercel
@@ -173,7 +189,8 @@ When a user forwards a file (document, video, audio, photo) to the bot:
 | Command | Description |
 |---------|-------------|
 | `/start` | Welcome message + main menu |
-| `/upload <url>` | Show service picker (inline keyboard) for URL upload |
+| `/stream <url>` | 🚀 Instant CDN stream via Gcore (returns streamable URL, no download) |
+| `/upload <url>` | Show service picker (inline keyboard) for URL upload (now also includes 🚀 Stream button) |
 | `/storage <url>` | Upload directly to storage.to (skip picker) |
 | `/pixeldrain <url>` | Upload directly to pixeldrain (skip picker) |
 | `/service` | Show / change default service (inline keyboard) |
@@ -184,8 +201,10 @@ When a user forwards a file (document, video, audio, photo) to the bot:
 | `/help` | Detailed help |
 | `/about` | About the bot |
 
-URLs sent as plain text auto-trigger the service picker (inline keyboard with both service buttons + Cancel).
+URLs sent as plain text auto-trigger the service picker (inline keyboard with 🚀 Stream, 📦 Storage.to, 🎬 PixelDrain, and ❌ Cancel buttons).
 Forwarded files also show the service picker.
+
+Persistent keyboard: [🚀 Stream] [🔗 Upload link] [🔄 Service] / [/status] [/help] [/ping].
 
 ## Update Log
 
@@ -222,3 +241,86 @@ Forwarded files also show the service picker.
 - Added Telegram file forwarding with inline keyboard prompt
 - Prefetch all part URLs upfront for speed
 - **TESTED SUCCESSFULLY**: 15.07GB MKV uploaded from hub.whistle.lat → storage.to/EU5xZI1O1
+
+### v7.0 (2026-07-13)
+- **Added "Instant CDN Stream" feature** powered by Gcore CDN — no download, no upload, no storage used
+- New command: `/stream <url>` — returns an instant streamable URL via Gcore edge
+- New file: `bot/api/_gcore.js` — Gcore API client (list/create origin groups, update CDN resource, purge cache)
+- `bot/api/webhook.js` changes:
+  - Imports `provisionStreamableUrl` from `_gcore.js`
+  - New `handleStreamRequest(chatId, url)` orchestrator that calls Gcore and replies with streamable URL
+  - New `pick_stream:<pendingId>` callback handler (Stream button in URL picker)
+  - New `/stream <url>` command + `/stream` (no args, shows help)
+  - New "🚀 Stream" persistent keyboard button (first slot in main menu)
+  - `servicePickerKeyboard()` now shows 3 rows: Stream button on top, then Storage.to + PixelDrain, then Cancel
+  - Updated WELCOME, HELP_MSG, ABOUT_MSG to mention the new feature
+- `bot/api/start.js`: added `/stream` to bot command menu (first slot), updated bot description
+- `bot/vercel.json`: bumped `api/webhook.js` `maxDuration` from 10 → 60s (Gcore API calls take 5-15s)
+- New env vars (Vercel): `GCORE_API_TOKEN`, `GCORE_CDN_RESOURCE_ID`, `GCORE_CDN_CNAME`
+- Architecture:
+  - ONE CDN resource is created manually in Gcore portal (one-time setup), CNAME'd to `cl-XXXX.gcdn.co`
+  - Per /stream request: Vercel finds-or-creates an origin group for the URL's host, then PATCHes the CDN resource to point at that origin group with video-friendly options (`slice` enabled for Range/seek, `hostHeader` set so origin sees correct Host, `ignoreQueryString` disabled so tokens in query work, `cors: *`, `disable_proxy_force_ranges: false`), then purges cache, then returns `https://<cname><path>?<query>`
+  - Gcore edge pulls from origin on-the-fly — payload never touches Vercel
+- **Status**: code complete, pending Gcore CDN service activation in portal (account is in "preparation" status, requires manual activation step)
+- **Test links** (PixelDrain):
+  - `https://pixeldrain.dev/api/file/Kd4Xvyan?download`
+  - `https://pixeldrain.dev/api/file/NoXAdA2G?download`
+  - `https://pixeldrain.dev/api/file/9eHdnBcK?download`
+
+## Gcore CDN — One-Time Setup (REQUIRED before /stream works)
+
+The Gcore account must have the CDN service activated before /stream will work.
+A fresh Gcore account is in "preparation" status with CDN `enabled: false`. To activate:
+
+1. Log in to https://portal.gcore.com
+2. Open the **CDN** product page
+3. Click **Activate** / **Try CDN** (may require adding a payment method, even for free tier)
+4. Once CDN shows status "Active", click **Create CDN resource**:
+   - **Custom domain**: enter a subdomain you control (e.g. `stream.yourdomain.com`)
+   - **Origin**: any placeholder (we'll override via API)
+   - **DNS option**: Do not delegate (CNAME)
+   - **SSL**: enable Let's Encrypt (free) so HTTPS works for streaming
+5. After creation, the portal shows `cl-XXXX.gcdn.co` — add a CNAME record at your DNS provider:
+   ```
+   stream.yourdomain.com.   CNAME   cl-XXXX.gcdn.co.
+   ```
+6. Wait for DNS propagation (~5-30 min). Verify with `dig stream.yourdomain.com`.
+7. Note the **resource ID** from the portal URL (e.g. `portal.gcore.com/cdn/resources/12345` → ID = `12345`)
+8. Set these Vercel env vars:
+   - `GCORE_API_TOKEN` — the permanent API token (starts with `XXXXX_`)
+   - `GCORE_CDN_RESOURCE_ID` — the numeric resource ID from step 7
+   - `GCORE_CDN_CNAME` — the custom domain from step 4 (e.g. `stream.yourdomain.com`)
+9. Redeploy Vercel (any push to `main` triggers it) and hit `/api/start?secret=...` to refresh the bot menu
+
+Once activated, the user can:
+- Send any video download URL → tap **🚀 Stream** → get back `https://stream.yourdomain.com/<path>?<query>` that streams via Gcore CDN
+- Or use `/stream <url>` directly
+
+### Gcore API endpoints used (all under `https://api.gcore.com`, auth: `Authorization: APIKey <token>`)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/iam/clients/me` | Verify token + account status |
+| GET | `/cdn/origin_groups?page=N&per_page=100` | List origin groups (paginated) |
+| POST | `/cdn/origin_groups` | Create a new origin group with a single host source |
+| PUT | `/cdn/resources/{id}` | Update the CDN resource (origin group, options) |
+| POST | `/cdn/resources/{id}/purge` | Purge all cache (body: `{"purge_all": true}`) |
+
+### CDN resource options we set on every /stream request
+
+| Option | Value | Why |
+|--------|-------|-----|
+| `originGroup` | `<id>` | Points the resource at the origin group for this host |
+| `originProtocol` | `HTTPS` or `HTTP` | Matches the source URL protocol |
+| `options.slice` | `{enabled: true, value: true}` | Chops large files into 10MB Range fragments so VLC can seek |
+| `options.hostHeader` | `{enabled: true, value: "<origin host>"}` | Origin sees correct Host header (not the CDN cname) |
+| `options.ignoreQueryString` | `{enabled: true, value: false}` | Different query strings = different cache entries (preserves `?download`, auth tokens) |
+| `options.cors` | `{enabled: true, value: ["*"], always: true}` | Allows web players and TVs to fetch |
+| `options.disable_proxy_force_ranges` | `{enabled: true, value: false}` | Allows 206 Partial Content responses |
+| `options.forward_host_header` | `{enabled: true, value: false}` | Disabled — we set `hostHeader` instead |
+
+### Error handling
+
+If Gcore returns "CDN service is stopped", the bot replies with a hint to activate CDN in the portal.
+If env vars are missing, the bot replies with a hint to set them in Vercel.
+Other errors are surfaced verbatim (truncated to 400 chars).

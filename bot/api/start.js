@@ -28,6 +28,7 @@ export default async function handler(req, res) {
 
   // 2. Set bot commands menu
   const commands = [
+    { command: "stream", description: "🚀 Instant CDN stream (Gcore)" },
     { command: "upload", description: "Upload link (asks which service)" },
     { command: "storage", description: "Upload directly to storage.to" },
     { command: "pixeldrain", description: "Upload directly to pixeldrain" },
@@ -52,12 +53,12 @@ export default async function handler(req, res) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       description:
-        "🎬 StreamToBuffer Bot — Send me any file link and I'll upload it to storage.to OR pixeldrain!\n\n" +
+        "🎬 StreamToBuffer Bot — Send me any file link and I'll either 🚀 stream it via Gcore CDN, or 📦 upload it to storage.to / pixeldrain!\n\n" +
         "✨ Features:\n" +
-        "• Pick service per upload (inline keyboard)\n" +
+        "• 🚀 /stream URL — instant CDN stream (no download, no upload)\n" +
+        "• 📦 /upload URL — pick service via inline button\n" +
         "• storage.to: anonymous, up to 25GB\n" +
         "• pixeldrain: persistent, account-based\n" +
-        "• Direct download passthrough — no conversion\n" +
         "• Forwarded Telegram files supported\n\n" +
         "Just send a URL to get started!",
     }),
@@ -68,7 +69,7 @@ export default async function handler(req, res) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      short_description: "File uploader — storage.to + pixeldrain",
+      short_description: "🚀 Instant CDN stream + 📦 file uploader (Gcore / storage.to / pixeldrain)",
     }),
   });
 
