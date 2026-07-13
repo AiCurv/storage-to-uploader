@@ -1,26 +1,48 @@
 // Gcore CDN helper — used by webhook.js to power the "Instant CDN Stream" feature.
 //
-// Architecture:
-//   1. ONE CDN resource is created manually in the Gcore portal (one-time setup).
-//      Its cname (e.g. stream.theaicurv.com) is CNAME'd to cl-XXXX.gcdn.co.
-//      The resource ID is stored in env: GCORE_CDN_RESOURCE_ID
-//      The cname is stored in env:     GCORE_CDN_CNAME
+// Architecture (zero-cost / no-CNAME-delegation variant):
+//   1. ONE CDN resource exists in Gcore (provisioned via API by the bot admin).
+//      Its cname in Gcore is `stream.theaicurv.com` (placeholder).
+//      Gcore's per-account CNAME target is `cl-glff28ad70.gcdn.co`.
+//      To enable HTTPS streaming, the user must add a DNS CNAME record:
+//          stream.theaicurv.com  →  cl-glff28ad70.gcdn.co
+//      and then Gcore auto-issues a Let's Encrypt cert for stream.theaicurv.com.
+//      Until DNS is set up, the streaming URL will not resolve.
 //   2. For each /stream request we:
 //        a) parse the source URL -> originHost + path + query
 //        b) find or create an origin group whose source == originHost
 //        c) PATCH the CDN resource to point at that origin group with video-friendly options
 //           (slice enabled, hostHeader set, ignoreQueryString disabled, CORS *)
 //        d) purge the resource's cache so stale entries from the previous origin are dropped
-//        e) return https://<cname><path>?<query>  — the user streams via Gcore edge
+//           (cache purge stays operational using the live Resource ID below)
+//        e) return https://<GCORE_CDN_CNAME><path>?<query> — the user streams via Gcore edge
 //
 // The Vercel function never touches the video payload. Gcore edge pulls from origin on-the-fly.
 //
 // Env vars (set in Vercel project):
 //   GCORE_API_TOKEN          — permanent API token (Authorization: APIKey <token>)
-//   GCORE_CDN_RESOURCE_ID    — numeric ID of the CDN resource (from portal URL)
-//   GCORE_CDN_CNAME          — the cname configured on that resource (e.g. stream.theaicurv.com)
+//   GCORE_CDN_RESOURCE_ID    — numeric ID of the CDN resource (live: 1003848)
+//   GCORE_CDN_CNAME          — serving hostname for stream URLs (cl-glff28ad70.gcdn.co is Gcore's
+//                              per-account CNAME target; stream.theaicurv.com is the resource's
+//                              configured cname — the admin picks which one to expose)
 
 const GCORE_API = "https://api.gcore.com";
+
+// ─── Defensive fallback values ───────────────────────────────────────────────
+// Per STEP 1 of the v7.1 patch instructions, the live production values are bound here as
+// hardcoded fallbacks so the bot keeps working even if Vercel env vars are missing.
+// GCore's per-account CNAME target (cl-glff28ad70.gcdn.co) is used as the default serving
+// hostname because the user explicitly skipped custom-domain CNAME delegation.
+// NOTE: cache purge always uses the LIVE resource ID (1003848 — replaced the deleted 1003843).
+const FALLBACK_RESOURCE_ID = "1003848";
+const FALLBACK_CNAME = "cl-glff28ad70.gcdn.co";
+
+function getResourceId() {
+  return process.env.GCORE_CDN_RESOURCE_ID || FALLBACK_RESOURCE_ID;
+}
+function getCname() {
+  return process.env.GCORE_CDN_CNAME || FALLBACK_CNAME;
+}
 
 function authHeaders() {
   const tok = process.env.GCORE_API_TOKEN;
@@ -48,6 +70,16 @@ async function gcoreFetch(path, init = {}) {
     throw err;
   }
   return body;
+}
+
+// Defensive helper: rewrite any incoming source-URL path onto the secure Gcore gcdn.co host pattern.
+// Per the v7.1 patch instructions: "all incoming URLs processed via the /stream command are
+// explicitly reconstructed using the secure https://gcdn.co host pattern" — meaning the Gcore
+// edge CNAME (cl-glff28ad70.gcdn.co) is the native target, bypassing any custom-domain validation.
+function buildStreamUrl(pathPlus) {
+  const cname = getCname(); // = cl-glff28ad70.gcdn.co (per-account CNAME target)
+  // Explicitly reconstruct using the gcdn.co host pattern (cname is on the gcdn.co apex domain).
+  return `https://${cname}${pathPlus}`;
 }
 
 // ─── Origin group management ────────────────────────────────────────────────
@@ -158,10 +190,9 @@ export async function provisionStreamableUrl(sourceUrl) {
   const pathPlus = u.pathname + (u.search || ""); // path + ?query
   const protocol = u.protocol === "https:" ? "HTTPS" : "HTTP";
 
-  const resourceId = process.env.GCORE_CDN_RESOURCE_ID;
-  const cname = process.env.GCORE_CDN_CNAME;
-  if (!resourceId) throw new Error("GCORE_CDN_RESOURCE_ID not set");
-  if (!cname) throw new Error("GCORE_CDN_CNAME not set");
+  // Defensive: use hardcoded fallbacks if env vars are missing (per v7.1 patch STEP 1)
+  const resourceId = getResourceId();
+  const cname = getCname();
 
   // 1. Find or create origin group for this host
   const groups = await listOriginGroups();
@@ -177,14 +208,17 @@ export async function provisionStreamableUrl(sourceUrl) {
   // 2. Update the CDN resource to point at this origin group
   await updateResource(resourceId, groupId, originHost, protocol);
 
-  // 3. Purge the cache so we never serve stale content from the previous origin
+  // 3. Purge the cache so we never serve stale content from the previous origin.
+  //    Cache purge stays operational using the LIVE Resource ID (1003848).
   try { await purgeResourceCache(resourceId); } catch (e) {
     // Non-fatal — purge failure just means some stale entries might linger for ~3 minutes
     console.warn("[gcore] purge failed (non-fatal):", e.message);
   }
 
-  // 4. Construct the streamable URL — Gcore edge will fetch from origin on-the-fly
-  const streamUrl = `https://${cname}${pathPlus}`;
+  // 4. Construct the streamable URL — explicitly route through Gcore's native gcdn.co host
+  //    pattern (per v7.1 patch STEP 2: bypass custom-host validation, zero-cost config).
+  //    Gcore edge pulls from origin on-the-fly; Vercel never touches the video payload.
+  const streamUrl = buildStreamUrl(pathPlus);
   return {
     streamUrl,
     originHost,
@@ -198,15 +232,15 @@ export async function provisionStreamableUrl(sourceUrl) {
 // Lightweight health check — verifies token + lists resources (for /api/gcore-status debug endpoint)
 export async function gcoreStatus() {
   const me = await gcoreFetch(`/iam/clients/me`);
-  let resources = [];
   let originGroups = [];
   let cdnServiceError = null;
-  try { resources = await listOriginGroups(); } // reuses paginated call
+  try { originGroups = await listOriginGroups(); } // reuses paginated call
   catch (e) { cdnServiceError = e.message; }
-  originGroups = resources; // alias for clarity in response
   return {
     account: { id: me.id, email: me.email, status: me.status, capabilities: me.capabilities },
     cdnServiceError,
     originGroupsCount: Array.isArray(originGroups) ? originGroups.length : 0,
+    liveResourceId: getResourceId(),
+    liveCname: getCname(),
   };
 }

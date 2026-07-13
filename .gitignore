@@ -1,3 +1,5 @@
 result.json
 node_modules/
 *.log
+.vercel
+.env*
