@@ -1,13 +1,13 @@
 // Gcore CDN helper — used by webhook.js to power the "Instant CDN Stream" feature.
 //
-// Architecture (zero-cost / no-CNAME-delegation variant):
-//   1. ONE CDN resource exists in Gcore (provisioned via API by the bot admin).
-//      Its cname in Gcore is `stream.theaicurv.com` (placeholder).
-//      Gcore's per-account CNAME target is `cl-glff28ad70.gcdn.co`.
-//      To enable HTTPS streaming, the user must add a DNS CNAME record:
-//          stream.theaicurv.com  →  cl-glff28ad70.gcdn.co
-//      and then Gcore auto-issues a Let's Encrypt cert for stream.theaicurv.com.
-//      Until DNS is set up, the streaming URL will not resolve.
+// Architecture (Dynu free subdomain + Gcore Let's Encrypt SSL — fully working HTTPS variant):
+//   1. ONE CDN resource exists in Gcore (id=1003900, provisioned via API by the bot admin).
+//      Its cname in Gcore is `cdn.streambot.freeddns.org`.
+//      DNS (managed on Dynu free DNS) has a CNAME record:
+//          cdn.streambot.freeddns.org  →  cl-glff28ad70.gcdn.co (Gcore per-account CNAME target)
+//      Let's Encrypt SSL cert (id=300754, automated=true) issued via Gcore API:
+//          POST /cdn/sslData {name, automated:true}  →  PATCH /cdn/resources/{id} {sslData, sslEnabled:true}
+//      Auto-renewal is handled by Gcore.
 //   2. For each /stream request we:
 //        a) parse the source URL -> originHost + path + query
 //        b) find or create an origin group whose source == originHost
@@ -21,21 +21,18 @@
 //
 // Env vars (set in Vercel project):
 //   GCORE_API_TOKEN          — permanent API token (Authorization: APIKey <token>)
-//   GCORE_CDN_RESOURCE_ID    — numeric ID of the CDN resource (live: 1003848)
-//   GCORE_CDN_CNAME          — serving hostname for stream URLs (cl-glff28ad70.gcdn.co is Gcore's
-//                              per-account CNAME target; stream.theaicurv.com is the resource's
-//                              configured cname — the admin picks which one to expose)
+//   GCORE_CDN_RESOURCE_ID    — numeric ID of the CDN resource (live: 1003900)
+//   GCORE_CDN_CNAME          — serving hostname for stream URLs (cdn.streambot.freeddns.org)
 
 const GCORE_API = "https://api.gcore.com";
 
 // ─── Defensive fallback values ───────────────────────────────────────────────
-// Per STEP 1 of the v7.1 patch instructions, the live production values are bound here as
-// hardcoded fallbacks so the bot keeps working even if Vercel env vars are missing.
-// GCore's per-account CNAME target (cl-glff28ad70.gcdn.co) is used as the default serving
-// hostname because the user explicitly skipped custom-domain CNAME delegation.
-// NOTE: cache purge always uses the LIVE resource ID (1003848 — replaced the deleted 1003843).
-const FALLBACK_RESOURCE_ID = "1003848";
-const FALLBACK_CNAME = "cl-glff28ad70.gcdn.co";
+// Hardcoded live production values — bot keeps working even if Vercel env vars are wiped.
+// Resource 1003900: cname=cdn.streambot.freeddns.org (Dynu free subdomain CNAME'd to
+// cl-glff28ad70.gcdn.co), Let's Encrypt SSL active (cert_id=300754, auto-renewed).
+// Cache purge always uses the LIVE resource ID (1003900).
+const FALLBACK_RESOURCE_ID = "1003900";
+const FALLBACK_CNAME = "cdn.streambot.freeddns.org";
 
 function getResourceId() {
   return process.env.GCORE_CDN_RESOURCE_ID || FALLBACK_RESOURCE_ID;
@@ -72,13 +69,11 @@ async function gcoreFetch(path, init = {}) {
   return body;
 }
 
-// Defensive helper: rewrite any incoming source-URL path onto the secure Gcore gcdn.co host pattern.
-// Per the v7.1 patch instructions: "all incoming URLs processed via the /stream command are
-// explicitly reconstructed using the secure https://gcdn.co host pattern" — meaning the Gcore
-// edge CNAME (cl-glff28ad70.gcdn.co) is the native target, bypassing any custom-domain validation.
+// Build the streamable URL: route any source-URL path through the Gcore edge using the
+// resource's cname (cdn.streambot.freeddns.org). HTTPS is served via Let's Encrypt.
+// The Vercel function never touches the video payload — Gcore edge pulls from origin on-the-fly.
 function buildStreamUrl(pathPlus) {
-  const cname = getCname(); // = cl-glff28ad70.gcdn.co (per-account CNAME target)
-  // Explicitly reconstruct using the gcdn.co host pattern (cname is on the gcdn.co apex domain).
+  const cname = getCname(); // = cdn.streambot.freeddns.org (Dynu free subdomain → cl-glff28ad70.gcdn.co)
   return `https://${cname}${pathPlus}`;
 }
 
@@ -96,6 +91,7 @@ async function listOriginGroups() {
   let page = 1;
   // First call without page to discover total pages
   while (true) {
+    // GCore API uses snake_case for this endpoint: /cdn/origin_groups (NOT /cdn/originGroups).
     const data = await gcoreFetch(`/cdn/origin_groups?page=${page}&per_page=100`);
     const arr = Array.isArray(data) ? data : (data && data.results) || (data && data.origin_groups) || [];
     if (Array.isArray(arr)) out.push(...arr);
@@ -128,6 +124,7 @@ async function createOriginGroup(host) {
     use_next: true,
     sources: [{ source: host, backup: false, enabled: true }],
   };
+  // GCore API uses snake_case: /cdn/origin_groups (NOT /cdn/originGroups).
   return await gcoreFetch(`/cdn/origin_groups`, {
     method: "POST",
     body: JSON.stringify(body),
@@ -209,15 +206,14 @@ export async function provisionStreamableUrl(sourceUrl) {
   await updateResource(resourceId, groupId, originHost, protocol);
 
   // 3. Purge the cache so we never serve stale content from the previous origin.
-  //    Cache purge stays operational using the LIVE Resource ID (1003848).
+  //    Cache purge stays operational using the LIVE Resource ID (1003900).
   try { await purgeResourceCache(resourceId); } catch (e) {
     // Non-fatal — purge failure just means some stale entries might linger for ~3 minutes
     console.warn("[gcore] purge failed (non-fatal):", e.message);
   }
 
-  // 4. Construct the streamable URL — explicitly route through Gcore's native gcdn.co host
-  //    pattern (per v7.1 patch STEP 2: bypass custom-host validation, zero-cost config).
-  //    Gcore edge pulls from origin on-the-fly; Vercel never touches the video payload.
+  // 4. Construct the streamable URL — route through Gcore edge using the resource's cname
+  //    (cdn.streambot.freeddns.org, Let's Encrypt SSL active). Vercel never touches video payload.
   const streamUrl = buildStreamUrl(pathPlus);
   return {
     streamUrl,
