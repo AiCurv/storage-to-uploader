@@ -212,6 +212,20 @@ Persistent keyboard: [🚀 Stream] [🔗 Upload link] [🔄 Service] / [/status]
 
 ## Update Log
 
+### v7.4 (2026-07-14)
+- **Smart URL routing for /stream** — fixes "I sent a non-pixeldrain URL and it didn't work" + "I sent the bot's own CDN URL back and it broke" issues. New `analyzeSourceUrl()` in `_gcore.js` runs BEFORE any GCore API call and returns one of five routing decisions:
+  - `self_loop` — URL is on our own CDN cname (`cdn.streambot.freeddns.org`). Refused with friendly error explaining the user should just open the URL directly. (Previously: bot repointed CDN origin at itself → infinite loop → 5xx → broken state for everyone until next /stream call.)
+  - `pixeldrain_list` — URL is `pixeldrain.com/l/<id>` (file list, returns HTML). Refused with instructions to open the list in browser, click the file, copy the `/u/<id>` URL, and send THAT to /stream.
+  - `expired_presigned` — URL has `X-Amz-Date` + `X-Amz-Expires` (or Azure `se=` or GCS `Expires=`) and the signature has already expired. Refused with the exact expiry timestamp. (This was the user's actual case: R2 URL with `X-Amz-Date=20260712T091946Z&X-Amz-Expires=28800` → expired at 2026-07-12T17:19:46Z, well before the user tried to use it.)
+  - `already_fast_cdn` — URL host matches R2 / S3 / CloudFront / Akamai / Bunny / KeyCDN / Fastly pattern. Returned as-is with explanation "already on a fast CDN, no GCore benefit". If URL has presigned params and is still valid, the expiry warning is included.
+  - `stream_via_gcore` — default; normal GCore CDN repoint flow.
+- **`provisionStreamableUrl()` return shape changed**: now returns `{ kind: "stream" | "passthrough" | "self_loop" | "expired" | "pixeldrain_list", ... }`. `webhook.js handleStreamRequest()` branches on `r.kind` and sends a tailored message for each case.
+- **Honest /stream help text** — `/stream` (no args) now lists what works (✅ pixeldrain single file, ✅ any direct download link, ⚠️ R2/S3/CloudFront already fast, ⚠️ presigned URLs expire) and what doesn't (❌ pixeldrain file lists, ❌ bot's own CDN URL fed back, ❌ auth-required links).
+- **Expiration warning on stream success** — if the source URL is a presigned URL (still valid), the success message now includes "⏰ Source URL expires in ~X hours" so the user knows the stream will die when the origin URL expires.
+- **Architecture limitation noted in success message** — each /stream call now warns: "⚠️ Important: each new /stream call repoints this CDN resource at the latest origin. This URL works until you /stream a different link, or until the source URL expires." This sets honest expectations about the single-resource repointing architecture.
+- **HTML-escape helper** — added `escapeHtml()` in webhook.js for user-supplied strings shown in Telegram HTML messages (prevents HTML injection from URL params in error messages).
+- **Tested**: 9/9 cases pass in `/home/z/my-project/scripts/test_analyze.mjs` covering self-loop, expired R2, fresh R2, pixeldrain list, pixeldrain /u/, pixeldrain /api/file/, arbitrary URL, S3, CloudFront.
+
 ### v7.3 (2026-07-13)
 - **Security hardening**: rotated `BOT_VERIFY_TOKEN` (old value was leaked in git history at commits `34e2d4c` and `6eb0841`); updated both Vercel env and GitHub secret with the new 64-hex-char value.
 - **Sanitized `DEVELOPER_CONTEXT.md`**: removed all hardcoded secrets (BOT_VERIFY_TOKEN, TELEGRAM_ALLOWED_ID, TELEGRAM_CHANNEL_ID, bot ID, channel ID). Replaced with placeholders pointing to Vercel env / GitHub secrets.

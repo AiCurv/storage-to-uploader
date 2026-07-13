@@ -172,15 +172,159 @@ async function purgeResourceCache(resourceId) {
   });
 }
 
-// ─── Top-level orchestrator ─────────────────────────────────────────────────
-
-// Returns { stream_url, origin_host, group_id, group_created, resource_id, cname }
-export async function provisionStreamableUrl(sourceUrl) {
-  if (!sourceUrl || typeof sourceUrl !== "string") throw new Error("sourceUrl required");
+// ─── Source URL routing analyzer ─────────────────────────────────────────────
+// Pre-flight check on the input URL — decides HOW to handle the /stream request.
+// Returns one of:
+//   { action: "self_loop", cname }                          — URL is on OUR OWN CDN cname → reject
+//   { action: "already_fast_cdn", originalUrl, host }       — URL is on R2/S3/CloudFront/etc → return as-is
+//   { action: "expired_presigned", originalUrl, expiredAt } — presigned URL already expired → warn
+//   { action: "pixeldrain_list", listId }                   — pixeldrain /l/<id> → tell user to send single file URLs
+//   { action: "stream_via_gcore", url: URL, presignedExpiresAt? } — normal case, repoint GCore origin
+export function analyzeSourceUrl(sourceUrl) {
   let u;
-  try { u = new URL(sourceUrl); } catch { throw new Error(`invalid URL: ${sourceUrl.slice(0, 100)}`); }
+  try { u = new URL(sourceUrl.trim()); } catch { throw new Error(`invalid URL: ${sourceUrl.slice(0, 100)}`); }
   if (!u.protocol.startsWith("http")) throw new Error("URL must be http(s)");
 
+  const host = u.host.toLowerCase();
+  const cname = getCname().toLowerCase();
+
+  // ── 1. Self-loop: URL is on our own CDN cname → reject (would create infinite origin loop) ──
+  if (host === cname || host.endsWith("." + cname)) {
+    return { action: "self_loop", cname };
+  }
+
+  // ── 2. Pixeldrain file LIST URL (/l/<id>) → returns HTML, not raw bytes ──
+  if (host === "pixeldrain.com" || host.endsWith(".pixeldrain.com")) {
+    const listMatch = u.pathname.match(/^\/l\/([A-Za-z0-9]+)/);
+    if (listMatch) {
+      return { action: "pixeldrain_list", listId: listMatch[1] };
+    }
+  }
+
+  // ── 3. Presigned URL expiration check (R2 / S3 / Azure / GCS) ──
+  //    Done BEFORE the fast-CDN check so an expired R2/S3 URL is reported as "expired"
+  //    rather than "already on a fast CDN" (which would tell the user to just open it — but it's dead).
+  //    AWS-style:  X-Amz-Date=YYYYMMDDTHHMMSSZ  &  X-Amz-Expires=<seconds>
+  //    Azure:      se=YYYY-MM-DDThh:mm:ssZ  (URL-encoded ISO 8601)
+  //    GCS:        Expires=<unix-epoch-seconds>
+  const amzDate = u.searchParams.get("X-Amz-Date");
+  const amzExpires = u.searchParams.get("X-Amz-Expires");
+  if (amzDate && amzExpires) {
+    const m = amzDate.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+    if (m) {
+      const dt = new Date(Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]));
+      const expiresAt = new Date(dt.getTime() + parseInt(amzExpires, 10) * 1000);
+      if (Date.now() > expiresAt.getTime()) {
+        return { action: "expired_presigned", originalUrl: sourceUrl, expiredAt: expiresAt.toISOString() };
+      }
+      // Not expired yet — but if host is a fast CDN, return as-is (no GCore benefit).
+      // Otherwise proceed via GCore (user gets a stream that works until origin URL expires).
+      const fastCdnPatterns = fastCdnPatternList();
+      for (const re of fastCdnPatterns) {
+        if (re.test(host)) {
+          return { action: "already_fast_cdn", originalUrl: sourceUrl, host, presignedExpiresAt: expiresAt.toISOString() };
+        }
+      }
+      return { action: "stream_via_gcore", url: u, presignedExpiresAt: expiresAt.toISOString() };
+    }
+  }
+  const azureSe = u.searchParams.get("se");
+  if (azureSe) {
+    try {
+      const expiresAt = new Date(decodeURIComponent(azureSe));
+      if (!isNaN(expiresAt.getTime())) {
+        if (Date.now() > expiresAt.getTime()) {
+          return { action: "expired_presigned", originalUrl: sourceUrl, expiredAt: expiresAt.toISOString() };
+        }
+        const fastCdnPatterns = fastCdnPatternList();
+        for (const re of fastCdnPatterns) {
+          if (re.test(host)) {
+            return { action: "already_fast_cdn", originalUrl: sourceUrl, host, presignedExpiresAt: expiresAt.toISOString() };
+          }
+        }
+        return { action: "stream_via_gcore", url: u, presignedExpiresAt: expiresAt.toISOString() };
+      }
+    } catch {}
+  }
+  const gcsExpires = u.searchParams.get("Expires");
+  if (gcsExpires) {
+    const expiresAt = new Date(parseInt(gcsExpires, 10) * 1000);
+    if (!isNaN(expiresAt.getTime())) {
+      if (Date.now() > expiresAt.getTime()) {
+        return { action: "expired_presigned", originalUrl: sourceUrl, expiredAt: expiresAt.toISOString() };
+      }
+      const fastCdnPatterns = fastCdnPatternList();
+      for (const re of fastCdnPatterns) {
+        if (re.test(host)) {
+          return { action: "already_fast_cdn", originalUrl: sourceUrl, host, presignedExpiresAt: expiresAt.toISOString() };
+        }
+      }
+      return { action: "stream_via_gcore", url: u, presignedExpiresAt: expiresAt.toISOString() };
+    }
+  }
+
+  // ── 4. Already-fast CDN hosts (no presigned URL params) — running through GCore adds no benefit ──
+  //    R2:          *.r2.cloudflarestorage.com  (Cloudflare R2 — already a CDN)
+  //    S3:          *.s3*.amazonaws.com          (AWS S3 — already a CDN, esp. with CloudFront in front)
+  //    CloudFront:  d[id].cloudfront.net
+  //    Akamai:      *.akamaihd.net, *.akamaized.net
+  //    Bunny:       *.b-cdn.net
+  //    KeyCDN:      *.kxcdn.com
+  //    Fastly:      *.fastly.net, *.fastlycdn.com
+  for (const re of fastCdnPatternList()) {
+    if (re.test(host)) {
+      return { action: "already_fast_cdn", originalUrl: sourceUrl, host };
+    }
+  }
+
+  // ── 5. Default: stream via GCore CDN (repoint origin, return CDN URL) ──
+  return { action: "stream_via_gcore", url: u };
+}
+
+// Shared list of "already fast" CDN host patterns. Used by analyzeSourceUrl in multiple places.
+function fastCdnPatternList() {
+  return [
+    /\.r2\.cloudflarestorage\.com$/i,
+    /\.s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$/i,
+    /^d[a-z0-9]+\.cloudfront\.net$/i,
+    /\.akamaihd\.net$/i,
+    /\.akamaized\.net$/i,
+    /\.b-cdn\.net$/i,
+    /\.kxcdn\.com$/i,
+    /\.fastlycdn\.com$/i,
+    /\.fastly\.net$/i,
+  ];
+}
+
+// ─── Top-level orchestrator ─────────────────────────────────────────────────
+//
+// Returns one of:
+//   { kind: "stream", streamUrl, originHost, groupId, groupCreated, resourceId, cname, presignedExpiresAt? }
+//   { kind: "passthrough", originalUrl, host, reason }   — already on a fast CDN, return as-is
+//   { kind: "self_loop", cname }                          — URL is on our own CDN, refused
+//   { kind: "expired", originalUrl, expiredAt }           — presigned URL already expired
+//   { kind: "pixeldrain_list", listId }                   — file list URL, not streamable directly
+export async function provisionStreamableUrl(sourceUrl) {
+  if (!sourceUrl || typeof sourceUrl !== "string") throw new Error("sourceUrl required");
+
+  const decision = analyzeSourceUrl(sourceUrl);
+
+  // ── Pass-through cases (no GCore API calls needed) ──
+  if (decision.action === "self_loop") {
+    return { kind: "self_loop", cname: decision.cname };
+  }
+  if (decision.action === "already_fast_cdn") {
+    return { kind: "passthrough", originalUrl: decision.originalUrl, host: decision.host, reason: "already_fast_cdn", presignedExpiresAt: decision.presignedExpiresAt || null };
+  }
+  if (decision.action === "expired_presigned") {
+    return { kind: "expired", originalUrl: decision.originalUrl, expiredAt: decision.expiredAt };
+  }
+  if (decision.action === "pixeldrain_list") {
+    return { kind: "pixeldrain_list", listId: decision.listId };
+  }
+
+  // ── Normal GCore CDN stream ──
+  const u = decision.url;
   const originHost = u.host; // includes port if non-default
   const pathPlus = u.pathname + (u.search || ""); // path + ?query
   const protocol = u.protocol === "https:" ? "HTTPS" : "HTTP";
@@ -214,12 +358,14 @@ export async function provisionStreamableUrl(sourceUrl) {
   //    (HTTPS via Let's Encrypt). Vercel never touches video payload.
   const streamUrl = buildStreamUrl(pathPlus);
   return {
+    kind: "stream",
     streamUrl,
     originHost,
     groupId,
     groupCreated,
     resourceId,
     cname,
+    presignedExpiresAt: decision.presignedExpiresAt || null,
   };
 }
 
