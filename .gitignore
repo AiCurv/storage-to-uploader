@@ -2,4 +2,6 @@ result.json
 node_modules/
 *.log
 .vercel
+# Ignore all .env files (real secrets) but keep .env.example (template for new contributors)
 .env*
+!.env.example

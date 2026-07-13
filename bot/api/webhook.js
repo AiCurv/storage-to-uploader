@@ -273,17 +273,20 @@ function logDispatch(stage, data) {
 
 // ─── Instant CDN Stream (Gcore) ──────────────────────────────────────────────
 
-async function handleStreamRequest(chatId, sourceUrl) {
+async function handleStreamRequest(chatId, sourceUrl, opts = {}) {
+  const { skipInitialMessage = false } = opts;
   if (!looksLikeUrl(sourceUrl)) {
     await sendMessage(chatId, "❌ Provide a valid URL.\nExample: <code>/stream https://pixeldrain.com/api/file/abc</code>", mainMenu());
     return;
   }
   // Normalize PixelDrain /u/<id> and /d/<id> to /api/file/<id> so the origin serves raw bytes
   const normalized = normalizeSourceUrl(sourceUrl) || sourceUrl;
-  await sendMessage(chatId,
-    "🚀 <b>Instant CDN Stream</b>\n" +
-    "⏳ Provisioning Gcore edge route... (5-10s)",
-    mainMenu());
+  if (!skipInitialMessage) {
+    await sendMessage(chatId,
+      "🚀 <b>Instant CDN Stream</b>\n" +
+      "⏳ Provisioning Gcore edge route... (5-10s)",
+      mainMenu());
+  }
   try {
     const r = await provisionStreamableUrl(normalized);
     const lines = [
@@ -292,7 +295,7 @@ async function handleStreamRequest(chatId, sourceUrl) {
       `🔗 <a href="${r.streamUrl}">${r.streamUrl}</a>`,
       "",
       `📡 Origin: <code>${r.originHost}</code>`,
-      `🌐 Gcore edge: <code>${r.cname}</code> (Dynu free subdomain → cl-glff28ad70.gcdn.co)`,
+      `🌐 Gcore edge: <code>${r.cname}</code>`,
       `🔒 SSL: Let's Encrypt (auto-renewed)`,
       `🆔 Resource: <code>${r.resourceId}</code> · cache purged`,
       r.groupCreated ? `✨ Origin group created (<code>${r.groupId}</code>)` : `♻️ Reused origin group (<code>${r.groupId}</code>)`,
@@ -458,9 +461,26 @@ export default async function handler(req, res) {
         await answerCallbackQuery(cb.id, "⚠️ Session expired. Please send the URL again.");
         return res.status(200).json({ ok: true });
       }
+      // IMPORTANT: Telegram callback queries must be answered quickly (the user sees a spinner
+      // on the button). We answer the callback immediately, send a "provisioning" message so
+      // the user has visual feedback, then return HTTP 200 to Telegram right away.
+      // handleStreamRequest runs in the background — Vercel keeps the function alive as long as
+      // there are pending promises (maxDuration=60s). Final stream URL is delivered as a
+      // separate Telegram message when Gcore provisioning completes (~2-3s).
       await answerCallbackQuery(cb.id, "🚀 Provisioning Gcore stream...");
-      // Run the stream flow (sends its own messages to chat)
-      await handleStreamRequest(chatId, pending.url);
+      await sendMessage(
+        chatId,
+        "🚀 <b>Instant CDN Stream</b>\n" +
+        "⏳ Provisioning Gcore edge route... (5-10s)",
+        mainMenu()
+      );
+      // Fire-and-forget: do NOT await — return HTTP 200 to Telegram immediately.
+      handleStreamRequest(chatId, pending.url, { skipInitialMessage: true })
+        .catch(err => {
+          console.error("[stream callback bg] error:", err.message, err.body || "");
+          sendMessage(chatId, `❌ <b>Stream failed:</b>\n<code>${(err.message || "unknown error").slice(0, 400)}</code>`, mainMenu())
+            .catch(() => {});
+        });
       return res.status(200).json({ ok: true });
     }
 
@@ -477,20 +497,32 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
       const svcInfo = SERVICES[service];
+      // Same non-blocking pattern as pick_stream: answer callback + send "queued" message,
+      // then return HTTP 200 immediately. triggerUpload runs in the background.
       await answerCallbackQuery(cb.id, `Uploading to ${svcInfo.short}...`);
-      try {
-        const { finalName } = await triggerUpload(pending.url, pending.filename, chatId, service);
-        await sendMessage(
-          chatId,
-          `⏬ <b>Uploading to ${svcInfo.label}</b>\n` +
-          `📦 <code>${finalName}</code>\n` +
-          `🔄 Downloading → Uploading...\n` +
-          `⏳ I'll message you when done!`,
-          mainMenu()
-        );
-      } catch (err) {
-        await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
-      }
+      await sendMessage(
+        chatId,
+        `⏬ <b>Uploading to ${svcInfo.label}</b>\n` +
+        `🔄 Queuing dispatch to GitHub Actions...\n` +
+        `⏳ I'll message you when done!`,
+        mainMenu()
+      );
+      // Fire-and-forget: do NOT await — return HTTP 200 to Telegram immediately.
+      (async () => {
+        try {
+          const { finalName } = await triggerUpload(pending.url, pending.filename, chatId, service);
+          await sendMessage(
+            chatId,
+            `📦 <b>Upload dispatched</b>\n` +
+            `<code>${finalName}</code>\n` +
+            `🔄 Downloading → Uploading...\n` +
+            `⏳ I'll message you when done!`,
+            mainMenu()
+          );
+        } catch (err) {
+          await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
+        }
+      })();
       return res.status(200).json({ ok: true });
     }
 
@@ -544,18 +576,29 @@ export default async function handler(req, res) {
       }
 
       await answerCallbackQuery(cb.id, `Uploading to ${SERVICES[service].short}...`);
-      try {
-        const { finalName } = await triggerUpload(fileSourceUrl, fileName, chatId, service);
-        await sendMessage(
-          chatId,
-          `⏬ <b>Uploading to ${SERVICES[service].label}</b>\n` +
-          `📦 <code>${finalName}</code>\n` +
-          `⏳ I'll message you when done!`,
-          mainMenu()
-        );
-      } catch (err) {
-        await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
-      }
+      await sendMessage(
+        chatId,
+        `⏬ <b>Uploading to ${SERVICES[service].label}</b>\n` +
+        `🔄 Queuing dispatch to GitHub Actions...\n` +
+        `⏳ I'll message you when done!`,
+        mainMenu()
+      );
+      // Fire-and-forget: do NOT await — return HTTP 200 to Telegram immediately.
+      (async () => {
+        try {
+          const { finalName } = await triggerUpload(fileSourceUrl, fileName, chatId, service);
+          await sendMessage(
+            chatId,
+            `📦 <b>Upload dispatched</b>\n` +
+            `<code>${finalName}</code>\n` +
+            `🔄 Downloading → Uploading...\n` +
+            `⏳ I'll message you when done!`,
+            mainMenu()
+          );
+        } catch (err) {
+          await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
+        }
+      })();
       return res.status(200).json({ ok: true });
     }
 
@@ -571,18 +614,28 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
       await answerCallbackQuery(cb.id, `Uploading to ${SERVICES[service].short}...`);
-      try {
-        const { finalName } = await triggerUpload(fileSourceUrl, fileName, chatId, service);
-        await sendMessage(
-          chatId,
-          `⏬ <b>Uploading to ${SERVICES[service].label}</b>\n` +
-          `📦 <code>${finalName}</code>\n` +
-          `⏳ I'll message you when done!`,
-          mainMenu()
-        );
-      } catch (err) {
-        await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
-      }
+      await sendMessage(
+        chatId,
+        `⏬ <b>Uploading to ${SERVICES[service].label}</b>\n` +
+        `🔄 Queuing dispatch to GitHub Actions...\n` +
+        `⏳ I'll message you when done!`,
+        mainMenu()
+      );
+      // Fire-and-forget: do NOT await — return HTTP 200 to Telegram immediately.
+      (async () => {
+        try {
+          const { finalName } = await triggerUpload(fileSourceUrl, fileName, chatId, service);
+          await sendMessage(
+            chatId,
+            `📦 <b>Upload dispatched</b>\n` +
+            `<code>${finalName}</code>\n` +
+            `⏳ I'll message you when done!`,
+            mainMenu()
+          );
+        } catch (err) {
+          await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
+        }
+      })();
       return res.status(200).json({ ok: true });
     }
 

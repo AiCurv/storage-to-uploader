@@ -90,7 +90,7 @@ User → Telegram Bot (@Streamtobufferbot)
 - Bot token in Vercel env (`TELEGRAM_BOT_TOKEN`) and GitHub secrets
 - File download: `getFile` → `https://api.telegram.org/file/bot<token>/<file_path>`
 - **20MB limit** for `/getFile` — larger files cannot be downloaded by bots this way
-- Channel: `curvstorage` (-1003990524943) — currently NOT used for file uploads (just sends link text)
+- Channel: `curvstorage` (channel ID stored in `TELEGRAM_CHANNEL_ID` env) — currently NOT used for file uploads (just sends link text)
 
 ## CRITICAL Errors & Solutions (DO NOT REPEAT!)
 
@@ -131,8 +131,8 @@ User → Telegram Bot (@Streamtobufferbot)
 
 ### 7. BOT_VERIFY_TOKEN mismatch between GitHub and Vercel
 **Problem**: The BOT_VERIFY_TOKEN in Vercel env was longer than what was set in GitHub secrets
-**Full token**: `787010dec8c8821b808e519f15c5d016b263640d59e06e68116ae5d9b32c5ef5` (64 hex chars)
-**Fix**: Updated GitHub secret to match Vercel env exactly
+**Full token**: (rotated in v7.3 — see `BOT_VERIFY_TOKEN` in Vercel env + GitHub secrets; never commit the real value)
+**Fix**: Updated GitHub secret to match Vercel env exactly. Token was rotated in v7.3 after the value was found in git history.
 
 ### 8. Vercel rootDirectory wrong
 **Problem**: Vercel project had `rootDirectory: "bot"` but was initially set to None
@@ -141,27 +141,31 @@ User → Telegram Bot (@Streamtobufferbot)
 ## Environment Variables & Secrets
 
 ### Vercel Env
-- `TELEGRAM_BOT_TOKEN` — Bot token (current: token for @Streamtobufferbot, id 8902303668)
-- `TELEGRAM_ALLOWED_ID` — User chat ID (6404893345) — hard-locks bot to this user
-- `BOT_VERIFY_TOKEN` — Shared secret for GitHub Actions → Vercel callback (`787010dec8c8821b808e519f15c5d016b263640d59e06e68116ae5d9b32c5ef5`)
-- `GH_TOKEN` — GitHub token for triggering dispatches
-- `GITHUB_REPO` — "AiCurv/storage-to-uploader"
-- `STORAGE_TO_VISITOR_TOKEN` — Token for storage.to upload ownership
+> **All values are stored in Vercel project env (https://vercel.com/.../storage-to-uploader/settings/env). NEVER hardcode them in code or docs.**
+
+- `TELEGRAM_BOT_TOKEN` — Bot token from @BotFather (format `123456:ABC...`)
+- `TELEGRAM_ALLOWED_ID` — Numeric Telegram user ID of the bot owner (the bot ONLY responds to this user)
+- `BOT_VERIFY_TOKEN` — 64-hex-char shared secret for GitHub Actions → Vercel callback (rotated in v7.3; identical value in GitHub secret)
+- `GH_TOKEN` — GitHub PAT for triggering repository_dispatch
+- `GITHUB_REPO` — `AiCurv/storage-to-uploader`
+- `STORAGE_TO_VISITOR_TOKEN` — Visitor token for storage.to upload ownership
 - `SETUP_SECRET` — Required to call /api/start endpoint (re-registers webhook)
 - `VERCEL_PROJECT_URL` — `storage-to-uploader.vercel.app`
-- `TELEGRAM_CHANNEL_ID` — `-1003990524943` (curvstorage channel, currently unused)
-- `GCORE_API_TOKEN` — Permanent Gcore API token (Authorization: APIKey <token>). Used by /stream.
-- `GCORE_CDN_RESOURCE_ID` — Numeric ID of the pre-created CDN resource (from portal URL)
-- `GCORE_CDN_CNAME` — The custom domain (cname) on the pre-created CDN resource (e.g. `stream.yourdomain.com`)
+- `TELEGRAM_CHANNEL_ID` — Telegram channel ID (negative number, currently unused)
+- `GCORE_API_TOKEN` — Permanent Gcore API token (`Authorization: APIKey <token>`). Used by /stream.
+- `GCORE_CDN_RESOURCE_ID` — Numeric ID of the pre-created CDN resource
+- `GCORE_CDN_CNAME` — Serving hostname (cname) on the pre-created CDN resource
 
 ### GitHub Secrets
+> **All values are stored in GitHub repo secrets (https://github.com/AiCurv/storage-to-uploader/settings/secrets). NEVER hardcode them in code or docs.**
+
 - `TELEGRAM_BOT_TOKEN` — Same as Vercel
-- `BOT_VERIFY_TOKEN` — Must match Vercel's exactly (64 hex chars)
+- `BOT_VERIFY_TOKEN` — Must match Vercel's exactly (64 hex chars; rotated in v7.3)
 - `VERCEL_CALLBACK_URL` — `https://storage-to-uploader.vercel.app/api/result`
 - `STORAGE_TO_VISITOR_TOKEN` — Same as Vercel
 - `PIXELDRAIN_TOKEN` — API key for pixeldrain uploads (HTTP Basic Auth, empty username)
-- `TELEGRAM_CHANNEL_ID` — `-1003990524943` (curvstorage channel)
-- `TELEGRAM_ALLOWED_ID` — `6404893345`
+- `TELEGRAM_CHANNEL_ID` — Same as Vercel
+- `TELEGRAM_ALLOWED_ID` — Same as Vercel
 - `GH_TOKEN` — Same as Vercel
 
 ## Multipart Upload Optimization
@@ -207,6 +211,19 @@ Forwarded files also show the service picker.
 Persistent keyboard: [🚀 Stream] [🔗 Upload link] [🔄 Service] / [/status] [/help] [/ping].
 
 ## Update Log
+
+### v7.3 (2026-07-13)
+- **Security hardening**: rotated `BOT_VERIFY_TOKEN` (old value was leaked in git history at commits `34e2d4c` and `6eb0841`); updated both Vercel env and GitHub secret with the new 64-hex-char value.
+- **Sanitized `DEVELOPER_CONTEXT.md`**: removed all hardcoded secrets (BOT_VERIFY_TOKEN, TELEGRAM_ALLOWED_ID, TELEGRAM_CHANNEL_ID, bot ID, channel ID). Replaced with placeholders pointing to Vercel env / GitHub secrets.
+- **New file `.env.example`** at repo root: lists ALL env vars used by the project (Telegram, GitHub, storage.to, pixeldrain, GCore CDN) with comments explaining where each one lives (Vercel env vs GitHub secret vs both).
+- **Sanitized code comments**: removed hardcoded GCore per-account CNAME target and Dynu subdomain literals from `_gcore.js` and `webhook.js` comments + user-facing message (kept only as hardcoded fallback constant in `_gcore.js`, which is fine since the cname is publicly visible via DNS anyway).
+- **Fixed non-blocking callback flow**: previously the `pick_stream:`, `pick_svc:`, `upload_file:`, and `pick_svc_file:` callback handlers `await`ed `handleStreamRequest` / `triggerUpload` BEFORE returning HTTP 200 to Telegram, causing the inline-button "bot isn't responding" error. Now all four handlers:
+  1. `await answerCallbackQuery` (dismiss button spinner immediately)
+  2. `await sendMessage` (send "provisioning" / "queued" feedback message)
+  3. Fire `handleStreamRequest` / `triggerUpload` as a non-awaited background promise
+  4. Return HTTP 200 immediately
+  Vercel keeps the function alive until the background promise settles (within `maxDuration=60s`), then delivers the final result as a separate Telegram message.
+- `handleStreamRequest(chatId, url, opts = {})` now accepts `{ skipInitialMessage: true }` so the callback flow can send its own feedback message first without duplication.
 
 ### v6.0 (2026-07-12)
 - **Added pixeldrain as second upload service** (user-selectable per upload)
