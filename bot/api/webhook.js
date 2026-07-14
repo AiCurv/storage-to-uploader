@@ -113,7 +113,13 @@ const ABOUT_MSG = [
 const userSettings = {};
 
 // Pending uploads: shortId → { url, filename, chatId, ts }
-// Used to bridge long URLs through Telegram's 64-byte callback_data limit
+// Used to bridge long URLs through Telegram's 64-byte callback_data limit.
+//
+// ⚠️ v7.6: This Map is in-memory and is WIPED on every Vercel cold start. To survive cold
+// starts, the URL is ALSO embedded in the picker message text (via createPendingUpload +
+// parseUrlFromPickerMessage). On callback, we first try the Map; if missing (cold start),
+// we fall back to parsing the URL from cb.message.text. This makes the inline button
+// reliable regardless of Vercel instance lifecycle.
 const pendingUploads = new Map();
 
 function getUserSettings(chatId) {
@@ -133,6 +139,10 @@ function makePendingId() {
     .join("");
 }
 
+// Create a pending upload entry AND return the message text that embeds the URL.
+// The picker message includes the URL in a parseable format so we can recover it
+// on callback even if the in-memory Map was wiped by a Vercel cold start.
+// Format: "🔗 URL received\n🌐 <code>{url}</code>\n📦 <code>{filename}</code>\n\nPick an action:"
 function createPendingUpload(url, filename, chatId) {
   // Cleanup old pendings (>10 min)
   const now = Date.now();
@@ -149,6 +159,49 @@ function takePendingUpload(id) {
   if (!p) return null;
   pendingUploads.delete(id);
   return p;
+}
+
+// v7.6: Recover URL from picker message text when in-memory Map was wiped (Vercel cold start).
+// Looks for any URL in the message text — first tries <code>...</code> blocks, then plain URL regex.
+// Returns the URL string or null if not found.
+function parseUrlFromPickerMessage(messageText) {
+  if (!messageText) return null;
+  // First try: extract from <code>URL</code> blocks
+  const codeMatch = messageText.match(/<code>(https?:\/\/[^<]+)<\/code>/i);
+  if (codeMatch) return codeMatch[1];
+  // Second try: plain URL regex (in case the message format changed)
+  const urlMatch = messageText.match(/https?:\/\/\S+/i);
+  return urlMatch ? urlMatch[0] : null;
+}
+
+// v7.6: Recover filename from picker message text. Looks for the second <code> block.
+// Note: filename is HTML-escaped when written to the picker message, so we unescape it here.
+function parseFilenameFromPickerMessage(messageText) {
+  if (!messageText) return null;
+  const codeMatches = messageText.matchAll(/<code>([^<]+)<\/code>/gi);
+  const matches = [...codeMatches];
+  if (matches.length >= 2) return unescapeHtml(matches[1][1]);
+  return null;
+}
+
+// v7.6: Reverse of escapeHtml — converts HTML entities back to literal chars.
+// Used when recovering filenames from picker message text.
+function unescapeHtml(s) {
+  return String(s).replace(/&(amp|lt|gt|quot|#39);/g, (m, e) => ({
+    "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'",
+  }[m]));
+}
+
+// v7.6: Look up a pending upload by id; if missing (cold start), recover URL from the picker
+// message text. Returns { url, filename, chatId, recoveredFromMessage } or null.
+function lookupPendingUpload(pendingId, pickerMessageText, chatId) {
+  const p = takePendingUpload(pendingId);
+  if (p) return { ...p, recoveredFromMessage: false };
+  // Fallback: parse URL from picker message text
+  const url = parseUrlFromPickerMessage(pickerMessageText);
+  if (!url) return null;
+  const filename = parseFilenameFromPickerMessage(pickerMessageText) || filenameFromUrl(url);
+  return { url, filename, chatId, ts: Date.now(), recoveredFromMessage: true };
 }
 
 async function sendMessage(chatId, text, extra = {}) {
@@ -347,9 +400,13 @@ async function handleStreamRequest(chatId, sourceUrl, opts = {}) {
       r.groupCreated ? `✨ Origin group created (<code>${r.groupId}</code>)` : `♻️ Reused origin group (<code>${r.groupId}</code>)`,
     ];
     if (r.ruleApplied) {
-      lines.push(r.ruleCreated
-        ? `✨ Stream rule created — strips Content-Disposition: attachment → inline`
-        : `♻️ Stream rule active — strips Content-Disposition: attachment → inline`);
+      if (r.ruleCreated) {
+        lines.push(`✨ Stream rule created (v7.6) — strips Content-Disposition, forces Accept-Ranges + Cache-Control`);
+      } else if (r.ruleUpgraded) {
+        lines.push(`⬆️ Stream rule upgraded to v7.6 — strips Content-Disposition, forces Accept-Ranges + Cache-Control`);
+      } else {
+        lines.push(`♻️ Stream rule active (v7.6) — strips Content-Disposition, forces Accept-Ranges + Cache-Control`);
+      }
     }
     if (r.presignedExpiresAt) {
       // Warn the user the source URL is a presigned URL that will expire
@@ -362,7 +419,8 @@ async function handleStreamRequest(chatId, sourceUrl, opts = {}) {
     lines.push("");
     lines.push("<b>How to use:</b>");
     lines.push("• Paste the URL into VLC / Stremio / your TV's media player");
-    lines.push("• <b>Pause / resume / seek all work</b> — Content-Disposition stripped to 'inline'");
+    lines.push("• <b>Pause / resume / seek all work</b> — Content-Disposition forced to 'inline'");
+    lines.push("• <b>Edge cache forced (4 days)</b> — defeats origin's no-store, second play = instant");
     lines.push("• Gcore pulls from origin on-the-fly — no download, no upload");
     lines.push("• First byte may take ~2-5s (cache warm-up), then full speed");
     lines.push("");
@@ -525,7 +583,10 @@ export default async function handler(req, res) {
     // Stream button picked — instant Gcore CDN stream, no download
     if (data.startsWith("pick_stream:")) {
       const [, pendingId] = data.split(":");
-      const pending = takePendingUpload(pendingId);
+      // v7.6: use lookupPendingUpload which falls back to parsing the URL from the picker
+      // message text if the in-memory Map was wiped (Vercel cold start).
+      const pickerMessageText = cb.message?.text || cb.message?.caption || "";
+      const pending = lookupPendingUpload(pendingId, pickerMessageText, chatId);
       if (!pending) {
         await answerCallbackQuery(cb.id, "⚠️ Session expired. Please send the URL again.");
         return res.status(200).json({ ok: true });
@@ -556,7 +617,10 @@ export default async function handler(req, res) {
     // Service picked for an upload (pending id present)
     if (data.startsWith("pick_svc:")) {
       const [, pendingId, service] = data.split(":");
-      const pending = takePendingUpload(pendingId);
+      // v7.6: use lookupPendingUpload which falls back to parsing the URL from the picker
+      // message text if the in-memory Map was wiped (Vercel cold start).
+      const pickerMessageText = cb.message?.text || cb.message?.caption || "";
+      const pending = lookupPendingUpload(pendingId, pickerMessageText, chatId);
       if (!pending) {
         await answerCallbackQuery(cb.id, "⚠️ Session expired. Please send the URL again.");
         return res.status(200).json({ ok: true });
@@ -904,14 +968,17 @@ export default async function handler(req, res) {
     }
 
     // Show service picker (pending-id based for short callback_data)
+    // v7.6: embed URL in message text so we can recover it on callback even if the
+    // in-memory pendingUploads Map was wiped by a Vercel cold start.
     const settings = getUserSettings(chatId);
     const cur = settings.defaultService || "storageto";
     const pendingId = createPendingUpload(sourceUrl, filename, chatId);
     await sendMessage(
       chatId,
       `🔗 <b>URL received</b>\n` +
-      `📦 <code>${filename}</code>\n\n` +
-      `Pick a service to upload to:`,
+      `🌐 <code>${sourceUrl}</code>\n` +
+      `📦 <code>${escapeHtml(filename)}</code>\n\n` +
+      `Pick an action:`,
       { reply_markup: servicePickerKeyboard(pendingId, cur) }
     );
   }

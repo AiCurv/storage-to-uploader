@@ -159,6 +159,20 @@ function buildResourcePatch(originGroupId, originHost, protocol) {
       disable_proxy_force_ranges: { enabled: true, value: false },
       // Forward the Host header from end-user request to origin — DISABLED because we set hostHeader above.
       forward_host_header: { enabled: true, value: false },
+      // ── v7.6 — force edge caching to defeat origin's `cache-control: private, no-store` ──
+      // Use `value` (not `default`) so the TTL applies to 200/206 responses REGARDLESS of
+      // what the origin sends in Cache-Control. storage.to sends `private, no-store` which
+      // would normally defeat CDN caching — `value` overrides that.
+      // "4d" = 4 days. The maximum is 1y. We use 4d to balance freshness vs cache hit rate.
+      edge_cache_settings: { enabled: true, value: "4d" },
+      // ── v7.6 — cache responses with Set-Cookie header ──
+      // storage.to sets a `visitor_token` cookie on every response. By default GCore treats
+      // responses with Set-Cookie as non-cacheable. Enabling ignore_cookie caches them as
+      // a single file regardless of cookie value.
+      ignore_cookie: { enabled: true, value: true },
+      // ── v7.6 — serve stale content while updating (smooths over origin hiccups) ──
+      // If origin returns an error or is updating, serve the last good cached response.
+      stale: { enabled: true, value: ["error", "updating"] },
     },
   };
 }
@@ -179,17 +193,48 @@ function buildResourcePatch(originGroupId, originHost, protocol) {
 //        last-modified, vary, content-encoding — all the headers needed for proper streaming.
 //      → The CDN auto-adds `content-range` for 206 Partial Content responses (seek works).
 //
-//   2. static_response_headers (value=[{name: "Content-Disposition", value: ["inline"], always: true}])
+//   2. static_response_headers with THREE overrides (v7.6):
+//        a. Content-Disposition: inline → players STREAM instead of DOWNLOADING.
+//        b. Accept-Ranges: bytes → explicitly advertise Range support (some origins omit this;
+//           players may then refuse to seek). GCore supports Range natively, so declaring it is safe.
+//        c. Cache-Control: public, max-age=86400 → DEFEATS origin's `private, no-store` so downstream
+//           players AND intermediate caches are allowed to cache. (Note: GCore edge cache is governed
+//           by `edge_cache_settings.value` on the resource, not by this header — this header is for
+//           the player side.)
 //      → Per GCore docs: "If the same header is already configured on your server, the CDN servers
-//        will override its value." So even though the hiding policy keeps content-disposition, this
-//        OVERRIDES the origin's "attachment" with "inline" → players stream instead of downloading.
-//      → `always: true` ensures it's added to ALL response codes (including 206 Partial Content).
+//        will override its value."
+//      → `always: true` ensures the override is added to ALL response codes (including 206 Partial
+//        Content).
 //
-// The result: players see `Content-Disposition: inline` → they STREAM instead of DOWNLOADING.
-// Pause/resume/seek all work because content-range, content-length, and content-type are preserved.
+// The result: players see `Content-Disposition: inline`, `Accept-Ranges: bytes`,
+// `Cache-Control: public, max-age=86400` → they STREAM with pause/resume/seek.
 //
-// This rule is idempotent — we check if it exists before creating. It persists across /stream calls.
-const STREAM_RULE_NAME = "strip-content-disposition-global-v75";
+// v7.6 also includes a RULE UPgrade check: if a rule with our name exists but its options don't
+// match the current spec (e.g. an older v7.5 rule with shorter excepted list), we PATCH it to
+// the latest spec. This handles the case where the rule was created before v7.6 and needs
+// to be brought up to date.
+const STREAM_RULE_NAME = "strip-content-disposition-global-v76";
+
+// The v7.6 spec for the stream rule's options. Used to detect outdated rules and PATCH them.
+const STREAM_RULE_OPTIONS_SPEC = {
+  response_headers_hiding_policy_excepted: [
+    "content-disposition",
+    "accept-ranges",
+    "cache-control",
+    "content-encoding",
+    "content-range",
+    "etag",
+    "expires",
+    "keep-alive",
+    "last-modified",
+    "vary",
+  ],
+  static_response_headers_value: [
+    { name: "Content-Disposition", value: ["inline"], always: true },
+    { name: "Accept-Ranges", value: ["bytes"], always: true },
+    { name: "Cache-Control", value: ["public, max-age=86400"], always: true },
+  ],
+};
 
 async function listResourceRules(resourceId) {
   const r = await gcoreFetch(`/cdn/resources/${resourceId}/rules`);
@@ -203,55 +248,36 @@ async function findStreamRule(resourceId) {
 }
 
 // Create the stream rule if it doesn't exist. Idempotent — safe to call on every /stream request.
-// Returns { ruleId, created } where created=true if we created it, false if it already existed.
+// v7.6: ALSO upgrades outdated rules to the latest spec (PATCHes them in place).
+// Returns { ruleId, created, upgraded } where:
+//   created=true   — we created a new rule
+//   upgraded=true  — we PATCHed an existing rule to bring it up to v7.6 spec
+//   both false     — rule was already up-to-date
 async function ensureStreamRules(resourceId) {
   // Check if a stream rule already exists. We look for:
-  //   1. A rule with our exact name (STREAM_RULE_NAME), OR
+  //   1. A rule with our exact name (STREAM_RULE_NAME, including previous versions like -v75), OR
   //   2. A rule with rule=".*" and ruleType=1 (regexp matching all URLs) — this is the functional
   //      equivalent, even if named differently (e.g. from a previous version or manual creation).
   const rules = await listResourceRules(resourceId);
   const existing = rules.find(r =>
     r.name === STREAM_RULE_NAME ||
+    r.name === "strip-content-disposition-global-v75" ||
+    r.name === "strip-content-disposition-global" ||
     (r.ruleType === 1 && r.rule === ".*")
   );
   if (existing) {
-    return { ruleId: existing.id, created: false };
+    // ── v7.6: check if existing rule's options match the current spec; PATCH if not ──
+    const needsUpgrade = !ruleMatchesSpec(existing);
+    if (needsUpgrade) {
+      console.log(`[gcore] upgrading stream rule ${existing.id} (name="${existing.name}") to v7.6 spec`);
+      const upgraded = await patchStreamRule(existing.id, resourceId);
+      return { ruleId: existing.id, created: false, upgraded: true };
+    }
+    return { ruleId: existing.id, created: false, upgraded: false };
   }
 
   // Create it. ruleType=1 (regexp), rule=".*" (match all URLs).
-  const body = {
-    name: STREAM_RULE_NAME,
-    ruleType: 1,           // 1 = regexp
-    rule: ".*",            // match all URLs
-    enabled: true,
-    options: {
-      // "Show ONLY these headers (+ 5 mandatory: connection, content-length, content-type, server, date).
-      // Hide everything else (including the origin's Content-Disposition: attachment)."
-      response_headers_hiding_policy: {
-        enabled: true,
-        mode: "show",
-        excepted: [
-          "content-disposition",  // kept, but overridden to 'inline' by static_response_headers below
-          "accept-ranges",        // tells player Range requests are supported (seek)
-          "cache-control",        // caching directives
-          "content-encoding",     // gzip/br — must be preserved
-          "etag",                 // revalidation
-          "expires",              // caching
-          "keep-alive",           // connection persistence
-          "last-modified",        // conditional GET
-          "vary",                 // caching variance
-        ],
-      },
-      // Override: force Content-Disposition: inline on every response.
-      // Per GCore docs, this OVERRIDES the origin's value if the same header is present.
-      static_response_headers: {
-        enabled: true,
-        value: [
-          { name: "Content-Disposition", value: ["inline"], always: true },
-        ],
-      },
-    },
-  };
+  const body = buildStreamRuleBody();
 
   try {
     const r = await gcoreFetch(`/cdn/resources/${resourceId}/rules`, {
@@ -262,19 +288,87 @@ async function ensureStreamRules(resourceId) {
     if (!ruleId) {
       throw new Error(`failed to create stream rule: ${JSON.stringify(r).slice(0, 400)}`);
     }
-    return { ruleId, created: true };
+    return { ruleId, created: true, upgraded: false };
   } catch (e) {
     // If the error is "rule_string must be unique", another rule with rule=".*" already exists
-    // (possibly with a different name from a previous version). Re-list and reuse it.
+    // (possibly with a different name from a previous version). Re-list, upgrade it, and reuse.
     if (e.message && e.message.includes("rule_string must be unique")) {
       const rules2 = await listResourceRules(resourceId);
       const existing2 = rules2.find(r => r.ruleType === 1 && r.rule === ".*");
       if (existing2?.id) {
-        return { ruleId: existing2.id, created: false };
+        await patchStreamRule(existing2.id, resourceId);
+        return { ruleId: existing2.id, created: false, upgraded: true };
       }
     }
     throw e;
   }
+}
+
+// Build the rule body for CREATE. Also used as the reference spec for upgrade checks.
+function buildStreamRuleBody() {
+  return {
+    name: STREAM_RULE_NAME,
+    ruleType: 1,           // 1 = regexp
+    rule: ".*",            // match all URLs
+    enabled: true,
+    options: {
+      // "Show ONLY these headers (+ 5 mandatory: connection, content-length, content-type, server, date).
+      // Hide everything else (cleans up CSP, x-robots-tag, etc. that might confuse players)."
+      response_headers_hiding_policy: {
+        enabled: true,
+        mode: "show",
+        excepted: STREAM_RULE_OPTIONS_SPEC.response_headers_hiding_policy_excepted,
+      },
+      // Override key headers to force streaming-friendly behavior.
+      // Per GCore docs: "If the same header is already configured on your server, the CDN servers
+      // will override its value."
+      static_response_headers: {
+        enabled: true,
+        value: STREAM_RULE_OPTIONS_SPEC.static_response_headers_value,
+      },
+    },
+  };
+}
+
+// Check if an existing rule's options match the current v7.6 spec.
+// Returns true if rule is up-to-date, false if it needs to be PATCHed.
+function ruleMatchesSpec(rule) {
+  if (!rule.options) return false;
+  const hp = rule.options.response_headers_hiding_policy;
+  if (!hp || !hp.enabled || hp.mode !== "show") return false;
+  // Compare excepted arrays (order-insensitive)
+  const expectedExcepted = STREAM_RULE_OPTIONS_SPEC.response_headers_hiding_policy_excepted;
+  const actualExcepted = hp.excepted || [];
+  if (actualExcepted.length !== expectedExcepted.length) return false;
+  const expectedSet = new Set(expectedExcepted);
+  if (!actualExcepted.every(h => expectedSet.has(h))) return false;
+  // Compare static_response_headers
+  const srh = rule.options.static_response_headers;
+  if (!srh || !srh.enabled) return false;
+  const expectedSrh = STREAM_RULE_OPTIONS_SPEC.static_response_headers_value;
+  const actualSrh = srh.value || [];
+  if (actualSrh.length !== expectedSrh.length) return false;
+  // Each expected entry must be present (by name + value + always)
+  for (const exp of expectedSrh) {
+    const match = actualSrh.find(a =>
+      a.name === exp.name &&
+      Array.isArray(a.value) &&
+      a.value.length === exp.value.length &&
+      a.value.every((v, i) => v === exp.value[i]) &&
+      a.always === exp.always
+    );
+    if (!match) return false;
+  }
+  return true;
+}
+
+// PATCH an existing rule to bring it up to v7.6 spec.
+async function patchStreamRule(ruleId, resourceId) {
+  const body = buildStreamRuleBody();
+  return await gcoreFetch(`/cdn/resources/${resourceId}/rules/${ruleId}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
 }
 
 // PATCH /cdn/resources/{id} — update the resource to point at the given origin group.
@@ -470,6 +564,7 @@ export async function provisionStreamableUrl(sourceUrl) {
     presignedExpiresAt: decision.presignedExpiresAt || null,
     ruleApplied: ruleInfo ? !!ruleInfo.ruleId : false,
     ruleCreated: ruleInfo ? ruleInfo.created : false,
+    ruleUpgraded: ruleInfo ? !!ruleInfo.upgraded : false,
   };
 }
 
