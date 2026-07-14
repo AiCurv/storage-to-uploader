@@ -15,13 +15,25 @@ export default async function handler(req, res) {
   const results = {};
 
   // 1. Set webhook
+  // ⚠️ v7.7 FIX: previously `allowed_updates` was missing `callback_query`, which caused
+  // ALL inline keyboard button taps to be silently filtered out by Telegram. The user
+  // would see "loads forever" / "bot isn't responding" on every tap. Including
+  // `callback_query` here is mandatory for the inline picker to work.
   const webhookUrl = `https://${vercelUrl}/api/webhook`;
   const wh = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       url: webhookUrl,
-      allowed_updates: ["message", "channel_post", "my_chat_member"],
+      allowed_updates: [
+        "message",
+        "edited_message",
+        "channel_post",
+        "edited_channel_post",
+        "callback_query",
+        "my_chat_member",
+        "chat_member",
+      ],
     }),
   });
   results.webhook = { url: webhookUrl, telegram: await wh.json() };
