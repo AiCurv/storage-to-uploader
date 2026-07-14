@@ -132,6 +132,14 @@ async function createOriginGroup(host) {
 // ─── CDN resource update ────────────────────────────────────────────────────
 
 // Build the PATCH body for the CDN resource to point at `originGroupId` with video-streaming options.
+//
+// NOTE (v7.5): Resource-level `static_response_headers` and `response_headers_hiding_policy` options
+// are stored by the API but NOT applied to responses (confirmed via live testing). Header manipulation
+// that actually works is done via a RULE — see `ensureStreamRules()` below. The rule matches all URLs
+// (ruleType=1 regexp, rule=".*") and carries the same options at the rule level, where they ARE honored.
+//
+// The resource-level options below (slice, hostHeader, cors, etc.) DO work — only the header-manipulation
+// ones needed to be moved to a rule.
 function buildResourcePatch(originGroupId, originHost, protocol) {
   return {
     originGroup: originGroupId,
@@ -155,6 +163,120 @@ function buildResourcePatch(originGroupId, originHost, protocol) {
   };
 }
 
+// ─── v7.5: Stream rules (header manipulation that makes download-only links streamable) ──────────
+//
+// GCore's resource-level `static_response_headers` and `response_headers_hiding_policy` options are
+// stored by the API but NOT applied to responses (confirmed via live testing July 2026). However, the
+// SAME options placed on a RULE ARE applied. So we create a single global rule (matches all URLs) that:
+//
+//   1. response_headers_hiding_policy (mode='show', excepted=[streaming-relevant headers])
+//      → In GCore's semantics, mode='show' = "show ONLY the excepted list (+ 5 mandatory headers:
+//        connection, content-length, content-type, server, date). Hide everything else."
+//      → This strips the origin's `Content-Disposition: attachment` (which forces download behavior
+//        in VLC / Stremio / TV players) because `content-disposition` is in our excepted list BUT
+//        we override it with `inline` via static_response_headers (next).
+//      → We also keep: accept-ranges (seek support), cache-control, etag, expires, keep-alive,
+//        last-modified, vary, content-encoding — all the headers needed for proper streaming.
+//      → The CDN auto-adds `content-range` for 206 Partial Content responses (seek works).
+//
+//   2. static_response_headers (value=[{name: "Content-Disposition", value: ["inline"], always: true}])
+//      → Per GCore docs: "If the same header is already configured on your server, the CDN servers
+//        will override its value." So even though the hiding policy keeps content-disposition, this
+//        OVERRIDES the origin's "attachment" with "inline" → players stream instead of downloading.
+//      → `always: true` ensures it's added to ALL response codes (including 206 Partial Content).
+//
+// The result: players see `Content-Disposition: inline` → they STREAM instead of DOWNLOADING.
+// Pause/resume/seek all work because content-range, content-length, and content-type are preserved.
+//
+// This rule is idempotent — we check if it exists before creating. It persists across /stream calls.
+const STREAM_RULE_NAME = "strip-content-disposition-global-v75";
+
+async function listResourceRules(resourceId) {
+  const r = await gcoreFetch(`/cdn/resources/${resourceId}/rules`);
+  return Array.isArray(r) ? r : (Array.isArray(r?.body) ? r.body : []);
+}
+
+// Returns the rule object if it exists, null otherwise.
+async function findStreamRule(resourceId) {
+  const rules = await listResourceRules(resourceId);
+  return rules.find(r => r.name === STREAM_RULE_NAME) || null;
+}
+
+// Create the stream rule if it doesn't exist. Idempotent — safe to call on every /stream request.
+// Returns { ruleId, created } where created=true if we created it, false if it already existed.
+async function ensureStreamRules(resourceId) {
+  // Check if a stream rule already exists. We look for:
+  //   1. A rule with our exact name (STREAM_RULE_NAME), OR
+  //   2. A rule with rule=".*" and ruleType=1 (regexp matching all URLs) — this is the functional
+  //      equivalent, even if named differently (e.g. from a previous version or manual creation).
+  const rules = await listResourceRules(resourceId);
+  const existing = rules.find(r =>
+    r.name === STREAM_RULE_NAME ||
+    (r.ruleType === 1 && r.rule === ".*")
+  );
+  if (existing) {
+    return { ruleId: existing.id, created: false };
+  }
+
+  // Create it. ruleType=1 (regexp), rule=".*" (match all URLs).
+  const body = {
+    name: STREAM_RULE_NAME,
+    ruleType: 1,           // 1 = regexp
+    rule: ".*",            // match all URLs
+    enabled: true,
+    options: {
+      // "Show ONLY these headers (+ 5 mandatory: connection, content-length, content-type, server, date).
+      // Hide everything else (including the origin's Content-Disposition: attachment)."
+      response_headers_hiding_policy: {
+        enabled: true,
+        mode: "show",
+        excepted: [
+          "content-disposition",  // kept, but overridden to 'inline' by static_response_headers below
+          "accept-ranges",        // tells player Range requests are supported (seek)
+          "cache-control",        // caching directives
+          "content-encoding",     // gzip/br — must be preserved
+          "etag",                 // revalidation
+          "expires",              // caching
+          "keep-alive",           // connection persistence
+          "last-modified",        // conditional GET
+          "vary",                 // caching variance
+        ],
+      },
+      // Override: force Content-Disposition: inline on every response.
+      // Per GCore docs, this OVERRIDES the origin's value if the same header is present.
+      static_response_headers: {
+        enabled: true,
+        value: [
+          { name: "Content-Disposition", value: ["inline"], always: true },
+        ],
+      },
+    },
+  };
+
+  try {
+    const r = await gcoreFetch(`/cdn/resources/${resourceId}/rules`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const ruleId = r?.id;
+    if (!ruleId) {
+      throw new Error(`failed to create stream rule: ${JSON.stringify(r).slice(0, 400)}`);
+    }
+    return { ruleId, created: true };
+  } catch (e) {
+    // If the error is "rule_string must be unique", another rule with rule=".*" already exists
+    // (possibly with a different name from a previous version). Re-list and reuse it.
+    if (e.message && e.message.includes("rule_string must be unique")) {
+      const rules2 = await listResourceRules(resourceId);
+      const existing2 = rules2.find(r => r.ruleType === 1 && r.rule === ".*");
+      if (existing2?.id) {
+        return { ruleId: existing2.id, created: false };
+      }
+    }
+    throw e;
+  }
+}
+
 // PATCH /cdn/resources/{id} — update the resource to point at the given origin group.
 async function updateResource(resourceId, originGroupId, originHost, protocol) {
   const body = buildResourcePatch(originGroupId, originHost, protocol);
@@ -164,22 +286,43 @@ async function updateResource(resourceId, originGroupId, originHost, protocol) {
   });
 }
 
-// Purge the entire cache for the resource so stale entries from the previous origin are dropped.
-async function purgeResourceCache(resourceId) {
-  return await gcoreFetch(`/cdn/resources/${resourceId}/purge`, {
-    method: "POST",
-    body: JSON.stringify({ purge_all: true }),
-  });
+// Purge cache for the resource. The GCore API requires `paths` (array of URL paths starting with /)
+// or `urls` — `purge_all: true` is NOT supported (returns 400). Rate limit: 1 purge per minute.
+// We purge the specific path being streamed (most relevant) + a wildcard attempt (best-effort).
+async function purgeResourceCache(resourceId, pathPlus) {
+  // pathPlus is the path+query from the source URL, e.g. "/api/file/abc?download"
+  // Extract just the path (without query) for purging — GCore purges by path pattern.
+  let pathOnly = pathPlus;
+  try {
+    const u = new URL(`https://example.com${pathPlus}`);
+    pathOnly = u.pathname;
+  } catch {}
+
+  // Try purging the specific path. If rate-limited (429), the non-fatal warning is logged.
+  try {
+    return await gcoreFetch(`/cdn/resources/${resourceId}/purge`, {
+      method: "POST",
+      body: JSON.stringify({ paths: [pathOnly] }),
+    });
+  } catch (e) {
+    // Non-fatal — purge failure just means some stale entries might linger for ~3 minutes
+    console.warn(`[gcore] purge for ${pathOnly} failed (non-fatal):`, e.message);
+  }
 }
 
 // ─── Source URL routing analyzer ─────────────────────────────────────────────
 // Pre-flight check on the input URL — decides HOW to handle the /stream request.
 // Returns one of:
 //   { action: "self_loop", cname }                          — URL is on OUR OWN CDN cname → reject
-//   { action: "already_fast_cdn", originalUrl, host }       — URL is on R2/S3/CloudFront/etc → return as-is
 //   { action: "expired_presigned", originalUrl, expiredAt } — presigned URL already expired → warn
 //   { action: "pixeldrain_list", listId }                   — pixeldrain /l/<id> → tell user to send single file URLs
 //   { action: "stream_via_gcore", url: URL, presignedExpiresAt? } — normal case, repoint GCore origin
+//
+// NOTE (v7.5): We NO LONGER pass through R2/S3/CloudFront/Akamai/Bunny/Fastly URLs as-is.
+// Previously we returned them unchanged ("already on a fast CDN, GCore adds no benefit"). But now
+// that GCore strips `Content-Disposition: attachment` via a rule, routing these URLs through GCore
+// turns "download-only" links (which force download in VLC/players) into streamable links. So we
+// route EVERYTHING through GCore (except self-loops, expired presigned URLs, and pixeldrain lists).
 export function analyzeSourceUrl(sourceUrl) {
   let u;
   try { u = new URL(sourceUrl.trim()); } catch { throw new Error(`invalid URL: ${sourceUrl.slice(0, 100)}`); }
@@ -202,8 +345,7 @@ export function analyzeSourceUrl(sourceUrl) {
   }
 
   // ── 3. Presigned URL expiration check (R2 / S3 / Azure / GCS) ──
-  //    Done BEFORE the fast-CDN check so an expired R2/S3 URL is reported as "expired"
-  //    rather than "already on a fast CDN" (which would tell the user to just open it — but it's dead).
+  //    If expired → refuse. If still valid → route through GCore (with expiration warning).
   //    AWS-style:  X-Amz-Date=YYYYMMDDTHHMMSSZ  &  X-Amz-Expires=<seconds>
   //    Azure:      se=YYYY-MM-DDThh:mm:ssZ  (URL-encoded ISO 8601)
   //    GCS:        Expires=<unix-epoch-seconds>
@@ -217,14 +359,6 @@ export function analyzeSourceUrl(sourceUrl) {
       if (Date.now() > expiresAt.getTime()) {
         return { action: "expired_presigned", originalUrl: sourceUrl, expiredAt: expiresAt.toISOString() };
       }
-      // Not expired yet — but if host is a fast CDN, return as-is (no GCore benefit).
-      // Otherwise proceed via GCore (user gets a stream that works until origin URL expires).
-      const fastCdnPatterns = fastCdnPatternList();
-      for (const re of fastCdnPatterns) {
-        if (re.test(host)) {
-          return { action: "already_fast_cdn", originalUrl: sourceUrl, host, presignedExpiresAt: expiresAt.toISOString() };
-        }
-      }
       return { action: "stream_via_gcore", url: u, presignedExpiresAt: expiresAt.toISOString() };
     }
   }
@@ -235,12 +369,6 @@ export function analyzeSourceUrl(sourceUrl) {
       if (!isNaN(expiresAt.getTime())) {
         if (Date.now() > expiresAt.getTime()) {
           return { action: "expired_presigned", originalUrl: sourceUrl, expiredAt: expiresAt.toISOString() };
-        }
-        const fastCdnPatterns = fastCdnPatternList();
-        for (const re of fastCdnPatterns) {
-          if (re.test(host)) {
-            return { action: "already_fast_cdn", originalUrl: sourceUrl, host, presignedExpiresAt: expiresAt.toISOString() };
-          }
         }
         return { action: "stream_via_gcore", url: u, presignedExpiresAt: expiresAt.toISOString() };
       }
@@ -253,54 +381,20 @@ export function analyzeSourceUrl(sourceUrl) {
       if (Date.now() > expiresAt.getTime()) {
         return { action: "expired_presigned", originalUrl: sourceUrl, expiredAt: expiresAt.toISOString() };
       }
-      const fastCdnPatterns = fastCdnPatternList();
-      for (const re of fastCdnPatterns) {
-        if (re.test(host)) {
-          return { action: "already_fast_cdn", originalUrl: sourceUrl, host, presignedExpiresAt: expiresAt.toISOString() };
-        }
-      }
       return { action: "stream_via_gcore", url: u, presignedExpiresAt: expiresAt.toISOString() };
     }
   }
 
-  // ── 4. Already-fast CDN hosts (no presigned URL params) — running through GCore adds no benefit ──
-  //    R2:          *.r2.cloudflarestorage.com  (Cloudflare R2 — already a CDN)
-  //    S3:          *.s3*.amazonaws.com          (AWS S3 — already a CDN, esp. with CloudFront in front)
-  //    CloudFront:  d[id].cloudfront.net
-  //    Akamai:      *.akamaihd.net, *.akamaized.net
-  //    Bunny:       *.b-cdn.net
-  //    KeyCDN:      *.kxcdn.com
-  //    Fastly:      *.fastly.net, *.fastlycdn.com
-  for (const re of fastCdnPatternList()) {
-    if (re.test(host)) {
-      return { action: "already_fast_cdn", originalUrl: sourceUrl, host };
-    }
-  }
-
-  // ── 5. Default: stream via GCore CDN (repoint origin, return CDN URL) ──
+  // ── 4. Default: stream via GCore CDN (repoint origin, return CDN URL) ──
+  //    This now includes R2/S3/CloudFront/etc. URLs — GCore strips Content-Disposition: attachment
+  //    via the stream rule, making "download-only" links streamable.
   return { action: "stream_via_gcore", url: u };
-}
-
-// Shared list of "already fast" CDN host patterns. Used by analyzeSourceUrl in multiple places.
-function fastCdnPatternList() {
-  return [
-    /\.r2\.cloudflarestorage\.com$/i,
-    /\.s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com$/i,
-    /^d[a-z0-9]+\.cloudfront\.net$/i,
-    /\.akamaihd\.net$/i,
-    /\.akamaized\.net$/i,
-    /\.b-cdn\.net$/i,
-    /\.kxcdn\.com$/i,
-    /\.fastlycdn\.com$/i,
-    /\.fastly\.net$/i,
-  ];
 }
 
 // ─── Top-level orchestrator ─────────────────────────────────────────────────
 //
 // Returns one of:
-//   { kind: "stream", streamUrl, originHost, groupId, groupCreated, resourceId, cname, presignedExpiresAt? }
-//   { kind: "passthrough", originalUrl, host, reason }   — already on a fast CDN, return as-is
+//   { kind: "stream", streamUrl, originHost, groupId, groupCreated, resourceId, cname, presignedExpiresAt?, ruleApplied?, ruleCreated? }
 //   { kind: "self_loop", cname }                          — URL is on our own CDN, refused
 //   { kind: "expired", originalUrl, expiredAt }           — presigned URL already expired
 //   { kind: "pixeldrain_list", listId }                   — file list URL, not streamable directly
@@ -312,9 +406,6 @@ export async function provisionStreamableUrl(sourceUrl) {
   // ── Pass-through cases (no GCore API calls needed) ──
   if (decision.action === "self_loop") {
     return { kind: "self_loop", cname: decision.cname };
-  }
-  if (decision.action === "already_fast_cdn") {
-    return { kind: "passthrough", originalUrl: decision.originalUrl, host: decision.host, reason: "already_fast_cdn", presignedExpiresAt: decision.presignedExpiresAt || null };
   }
   if (decision.action === "expired_presigned") {
     return { kind: "expired", originalUrl: decision.originalUrl, expiredAt: decision.expiredAt };
@@ -347,14 +438,25 @@ export async function provisionStreamableUrl(sourceUrl) {
   // 2. Update the CDN resource to point at this origin group
   await updateResource(resourceId, groupId, originHost, protocol);
 
-  // 3. Purge the cache so we never serve stale content from the previous origin.
-  //    Cache purge stays operational using the LIVE resource ID from env.
-  try { await purgeResourceCache(resourceId); } catch (e) {
+  // 3. Ensure the stream rules exist (creates the Content-Disposition stripping rule if missing).
+  //    This is what makes "download-only" links streamable in VLC / Stremio / TV.
+  //    Idempotent — only creates the rule if it doesn't already exist.
+  let ruleInfo = null;
+  try {
+    ruleInfo = await ensureStreamRules(resourceId);
+  } catch (e) {
+    // Non-fatal — if rule creation fails, streaming still works but Content-Disposition won't be stripped
+    console.warn("[gcore] ensureStreamRules failed (non-fatal):", e.message);
+  }
+
+  // 4. Purge the cache for this specific path so we never serve stale content from the previous origin.
+  //    Note: GCore purge API requires `paths` (not `purge_all`), rate limit 1/minute.
+  try { await purgeResourceCache(resourceId, pathPlus); } catch (e) {
     // Non-fatal — purge failure just means some stale entries might linger for ~3 minutes
     console.warn("[gcore] purge failed (non-fatal):", e.message);
   }
 
-  // 4. Construct the streamable URL — route through Gcore edge using the resource's cname
+  // 5. Construct the streamable URL — route through Gcore edge using the resource's cname
   //    (HTTPS via Let's Encrypt). Vercel never touches video payload.
   const streamUrl = buildStreamUrl(pathPlus);
   return {
@@ -366,6 +468,8 @@ export async function provisionStreamableUrl(sourceUrl) {
     resourceId,
     cname,
     presignedExpiresAt: decision.presignedExpiresAt || null,
+    ruleApplied: ruleInfo ? !!ruleInfo.ruleId : false,
+    ruleCreated: ruleInfo ? ruleInfo.created : false,
   };
 }
 

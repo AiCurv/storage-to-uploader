@@ -334,37 +334,6 @@ async function handleStreamRequest(chatId, sourceUrl, opts = {}) {
       return;
     }
 
-    if (r.kind === "passthrough") {
-      // URL is already on a fast CDN (R2/S3/CloudFront/Akamai/Bunny/etc.) — no GCore benefit
-      const lines = [
-        "✅ <b>Already on a fast CDN — no acceleration needed</b>",
-        "",
-        `🔗 <a href="${escapeHtml(r.originalUrl)}">${escapeHtml(r.originalUrl)}</a>`,
-        "",
-        `📡 Source host: <code>${r.host}</code>`,
-        "",
-        "This URL is already served from a major CDN (Cloudflare R2 / AWS S3+CloudFront / Akamai / Bunny / Fastly / etc.).",
-        "Running it through Gcore would add an extra hop with no speed benefit — and could break if the source URL is a presigned URL that expires.",
-        "",
-        "<b>Just open the URL directly</b> in VLC / Stremio / your TV — it's already fast.",
-      ];
-      if (r.presignedExpiresAt) {
-        const expiryDate = new Date(r.presignedExpiresAt);
-        const hoursLeft = Math.max(0, (expiryDate.getTime() - Date.now()) / 3600000);
-        lines.push("");
-        lines.push(`⏰ <b>Source URL expires in ~${hoursLeft.toFixed(1)} hours</b> (at ${expiryDate.toISOString()})`);
-        lines.push("After that, this URL returns 403 Forbidden — get a fresh presigned URL from your source.");
-      } else {
-        lines.push("");
-        lines.push("💡 If the URL doesn't work, the cause is usually:");
-        lines.push("• It's a presigned URL that's expired (check for <code>X-Amz-Date</code> in the URL)");
-        lines.push("• The origin requires auth/cookies that the CDN can't forward");
-        lines.push("• Your player doesn't follow redirects");
-      }
-      await sendMessage(chatId, lines.join("\n"), mainMenu());
-      return;
-    }
-
     // ── Default: kind === "stream" — normal Gcore CDN stream ──
     const lines = [
       "🚀 <b>Stream ready!</b>",
@@ -377,6 +346,11 @@ async function handleStreamRequest(chatId, sourceUrl, opts = {}) {
       `🆔 Resource: <code>${r.resourceId}</code> · cache purged`,
       r.groupCreated ? `✨ Origin group created (<code>${r.groupId}</code>)` : `♻️ Reused origin group (<code>${r.groupId}</code>)`,
     ];
+    if (r.ruleApplied) {
+      lines.push(r.ruleCreated
+        ? `✨ Stream rule created — strips Content-Disposition: attachment → inline`
+        : `♻️ Stream rule active — strips Content-Disposition: attachment → inline`);
+    }
     if (r.presignedExpiresAt) {
       // Warn the user the source URL is a presigned URL that will expire
       const expiryDate = new Date(r.presignedExpiresAt);
@@ -388,7 +362,7 @@ async function handleStreamRequest(chatId, sourceUrl, opts = {}) {
     lines.push("");
     lines.push("<b>How to use:</b>");
     lines.push("• Paste the URL into VLC / Stremio / your TV's media player");
-    lines.push("• Seek works (slice engine enabled)");
+    lines.push("• <b>Pause / resume / seek all work</b> — Content-Disposition stripped to 'inline'");
     lines.push("• Gcore pulls from origin on-the-fly — no download, no upload");
     lines.push("• First byte may take ~2-5s (cache warm-up), then full speed");
     lines.push("");
@@ -981,19 +955,21 @@ export default async function handler(req, res) {
   if (cleanText === "/stream") {
     await sendMessage(
       chatId,
-      "🚀 <b>Instant CDN Stream</b>\n\n" +
+      "🚀 <b>Instant CDN Stream — works with ANY direct download link</b>\n\n" +
       "Usage: <code>/stream &lt;url&gt;</code>\n\n" +
-      "<b>What works:</b>\n" +
-      "✅ Pixeldrain single file — <code>/stream https://pixeldrain.com/u/abc</code> (best — files never expire)\n" +
-      "✅ Any direct download link (raw bytes + Range support)\n" +
-      "⚠️ R2/S3/CloudFront/Akamai/etc. — already fast CDNs, I'll just return the original URL\n" +
-      "⚠️ Presigned URLs (X-Amz-* params) — work, but die after 1-8 hours\n\n" +
+      "<b>What works (all streamable, with pause/resume/seek):</b>\n" +
+      "✅ Pixeldrain single file — <code>/stream https://pixeldrain.com/u/abc</code> (files never expire)\n" +
+      "✅ Google video-downloads URLs (download-only links — GCore strips Content-Disposition: attachment)\n" +
+      "✅ storage.to raw URLs (download-only — same trick)\n" +
+      "✅ R2 / S3 / CloudFront / Akamai / Bunny / Fastly presigned URLs (while still valid)\n" +
+      "✅ Any direct download link (raw bytes + Range support)\n\n" +
       "<b>What doesn't work:</b>\n" +
       "❌ Pixeldrain file lists (<code>/l/&lt;id&gt;</code>) — they're HTML pages, not raw bytes\n" +
       "❌ The bot's own CDN URL fed back to /stream — would create an infinite loop\n" +
+      "❌ Expired presigned URLs (X-Amz-Date + X-Amz-Expires — check expiry before sending)\n" +
       "❌ Links requiring login / cookies / auth headers\n\n" +
-      "I'll give you back a fast Gcore CDN URL you can stream in VLC / Stremio / TV.\n" +
-      "No download, no upload — Gcore edge pulls from origin on-the-fly.",
+      "<b>How it works:</b> GCore CDN repoints at the origin, strips Content-Disposition: attachment,\n" +
+      "and serves the file as a streamable URL. Pause / resume / seek all work. No download, no upload.",
       mainMenu()
     );
     return res.status(200).json({ ok: true });

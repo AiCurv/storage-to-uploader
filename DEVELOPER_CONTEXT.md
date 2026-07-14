@@ -212,6 +212,63 @@ Persistent keyboard: [🚀 Stream] [🔗 Upload link] [🔄 Service] / [/status]
 
 ## Update Log
 
+### v7.5 (2026-07-14)
+**MAJOR FEATURE: "Download-only" links are now streamable.** Previously, URLs that returned `Content-Disposition: attachment` (Google video-downloads.googleusercontent.com, storage.to raw URLs, R2/S3 presigned URLs with response-content-disposition=attachment, etc.) would force VLC/Stremio/TV players to DOWNLOAD instead of STREAM. Now GCore strips that header at the edge, so the same URLs stream with full pause/resume/seek support.
+
+**How it works (the hard-won discovery):**
+- GCore has TWO mechanisms for response-header manipulation: resource-level `options` and rule-level `options`.
+- **Resource-level `static_response_headers` and `response_headers_hiding_policy` are stored by the API but NOT applied to responses** (confirmed via live testing — options are set on the resource, edge nodes return 200 OK, but responses still have the origin's headers). This is a GCore bug/quirk as of July 2026.
+- **Rule-level options ARE applied.** A rule with `ruleType=1` (regexp), `rule=".*"` (match all URLs), and `options: { response_headers_hiding_policy, static_response_headers }` correctly strips/overrides headers at the edge.
+- The rule is created once (idempotent — `ensureStreamRules()` checks if it exists before creating). It persists across /stream calls.
+
+**The stream rule does two things:**
+1. `response_headers_hiding_policy` with `mode='show'` + `excepted=[content-disposition, accept-ranges, cache-control, content-encoding, etag, expires, keep-alive, last-modified, vary]`
+   - In GCore's semantics, `mode='show'` = "show ONLY the excepted list (+ 5 mandatory headers: connection, content-length, content-type, server, date). Hide everything else."
+   - This strips the origin's `Content-Disposition: attachment` (it's in the excepted list, so it's KEPT, but then overridden by #2 below).
+   - Wait — that's confusing. Actually: `content-disposition` is in the excepted list, so it's KEPT (shown). Then `static_response_headers` overrides it to `inline`. The hiding policy also strips other non-essential headers (content-security-policy, x-robots-tag, x-ratelimit-*, etc.) for cleaner responses.
+2. `static_response_headers` with `value=[{name: "Content-Disposition", value: ["inline"], always: true}]`
+   - Per GCore docs: "If the same header is already configured on your server, the CDN servers will override its value."
+   - So the origin's `Content-Disposition: attachment` is overridden to `Content-Disposition: inline`.
+   - `always: true` ensures it's added to ALL response codes (including 206 Partial Content).
+
+**Result:** Players see `Content-Disposition: inline` → they STREAM instead of DOWNLOADING. Pause/resume/seek all work because `content-range`, `content-length`, and `content-type` are preserved (mandatory + auto-added by CDN for 206 responses).
+
+**Other changes in v7.5:**
+- **Removed the `already_fast_cdn` passthrough.** Previously, URLs on R2/S3/CloudFront/Akamai/Bunny/Fastly were returned as-is ("already on a fast CDN, GCore adds no benefit"). Now that GCore strips Content-Disposition, routing these URLs through GCore turns "download-only" links into streamable links. So EVERYTHING (except self-loops, expired presigned URLs, and pixeldrain lists) is routed through GCore.
+- **Fixed the purge function.** The old `purgeResourceCache()` used `{purge_all: true}` which GCore's API rejects (returns 400: "One of parameters should be provided: paths, urls"). It was silently failing (caught by try/catch, logged as non-fatal warning). Now uses `{paths: [pathOnly]}` to purge the specific path being streamed. Rate limit: 1 purge per minute.
+- **`analyzeSourceUrl()` simplified** — removed the `fastCdnPatternList()` function and the `already_fast_cdn` action. The analyzer now returns only: `self_loop`, `expired_presigned`, `pixeldrain_list`, or `stream_via_gcore`.
+- **`provisionStreamableUrl()` return shape updated** — removed `kind: "passthrough"`. Added `ruleApplied` and `ruleCreated` fields to `kind: "stream"` results so the user sees whether the Content-Disposition stripping rule is active.
+- **Updated `/stream` help text** — now explicitly mentions "works with ANY direct download link" including Google video-downloads URLs, storage.to raw URLs, and R2/S3/CloudFront presigned URLs.
+- **Updated success message** — now shows "♻️ Stream rule active — strips Content-Disposition: attachment → inline" and "Pause / resume / seek all work — Content-Disposition stripped to 'inline'".
+- **E2E verified** with pixeldrain `/api/file/Kd4Xvyan?download` (which returns `Content-Disposition: attachment`):
+  - Origin response: `content-disposition: attachment; filename="Enola.Holmes.2020...mkv"`
+  - CDN response after v7.5: `content-disposition: inline` ✅
+  - `content-range: bytes 0-1023/6603016635` (seek works) ✅
+  - `content-type: video/x-matroska` ✅
+  - `content-length: 1024` ✅
+- **Tested**: 10/10 cases pass in `scripts/test_analyze.mjs` covering self-loop, expired R2, fresh R2 (now via GCore), Google video-downloads URL, pixeldrain list, pixeldrain /u/, pixeldrain /api/file/, arbitrary URL, S3 (now via GCore), CloudFront (now via GCore).
+
+**GCore API endpoints used (new in v7.5):**
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/cdn/resources/{id}/rules` | List all rules on the resource |
+| POST | `/cdn/resources/{id}/rules` | Create a new rule (with `ruleType`, `rule`, `options`) |
+| DELETE | `/cdn/resources/{id}/rules/{rule_id}` | Delete a rule (used in probe scripts, not production) |
+
+**GCore rule schema (discovered via probing):**
+- `ruleType`: integer — `0` (direct), `1` (regexp), `2` (rewrite). NOT a string.
+- `rule`: string — the URL pattern. For regexp, `".*"` matches all URLs.
+- `name`: string — human-readable name.
+- `enabled`: boolean.
+- `options`: object — same shape as resource-level options, but these ARE applied to responses matching the rule.
+- `rule_string` (the `rule` field) must be unique across rules on the same resource — you can't have two rules with `rule=".*"`.
+
+**GCore response_headers_hiding_policy semantics (discovered via live testing):**
+- `mode='hide'` + `excepted=[list]` = "hide ALL EXCEPT these" (the default; excepted list = headers to KEEP)
+- `mode='show'` + `excepted=[list]` = "show ONLY these (+ 5 mandatory)" (excepted list = headers to SHOW; everything else is hidden)
+- The 5 mandatory headers (connection, content-length, content-type, server, date) cannot be hidden — GCore always returns them.
+- For `mode='show'`, it's forbidden to include the mandatory headers in the excepted list (redundant — they're always shown).
+
 ### v7.4 (2026-07-14)
 - **Smart URL routing for /stream** — fixes "I sent a non-pixeldrain URL and it didn't work" + "I sent the bot's own CDN URL back and it broke" issues. New `analyzeSourceUrl()` in `_gcore.js` runs BEFORE any GCore API call and returns one of five routing decisions:
   - `self_loop` — URL is on our own CDN cname (`cdn.streambot.freeddns.org`). Refused with friendly error explaining the user should just open the URL directly. (Previously: bot repointed CDN origin at itself → infinite loop → 5xx → broken state for everyone until next /stream call.)
