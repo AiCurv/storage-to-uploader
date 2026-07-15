@@ -24,7 +24,8 @@ on:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Fix 5: Extended from 120 → 240 minutes (4 hours) for large file uploads.
+    timeout-minutes: 240
     env:
       PIXELDRAIN_TOKEN: ${{ secrets.PIXELDRAIN_TOKEN }}
       VERCEL_CALLBACK_URL: ${{ secrets.VERCEL_CALLBACK_URL }}
@@ -34,16 +35,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Free disk space
-        shell: bash
-        run: |
-          echo "=== Disk space before cleanup ==="
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
-          sudo apt-get clean || true
-          docker system prune -af || true
-          echo "=== Disk space after cleanup ==="
-          df -h /
+      # Fix 1: Replace the slow manual `rm -rf` + `apt-get clean` + `docker prune`
+      # with easimon/maximize-build-space (frees 40-50GB in under 30s).
+      - name: Maximize build disk space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -92,3 +94,17 @@ jobs:
           echo "Running: node upload.mjs <url> '${FILENAME}' '' '${SERVICE_VAL}'"
 
           node upload.mjs "${ARGS[@]}"
+
+      # Fix 6: Always-on logging step — captures final disk state for debugging.
+      - name: Log disk space and upload details
+        if: always()
+        shell: bash
+        run: |
+          echo "=== Final Disk State ==="
+          df -h /
+          echo ""
+          echo "=== Work Dir Contents (if any) ==="
+          ls -lh /tmp/storageto/ 2>/dev/null || echo "(work dir already cleaned or never created)"
+          echo ""
+          echo "=== Workflow Conclusion ==="
+          echo "job_status=${{ job.status }}"

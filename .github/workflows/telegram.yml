@@ -26,7 +26,9 @@ on:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Fix 5: Extended from 120 → 240 minutes (4 hours) so 15-25GB uploads on
+    # slow links don't hit the workflow-level timeout before completing.
+    timeout-minutes: 240
     env:
       PIXELDRAIN_TOKEN: ${{ secrets.PIXELDRAIN_TOKEN }}
       VERCEL_CALLBACK_URL: ${{ secrets.VERCEL_CALLBACK_URL }}
@@ -36,16 +38,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Free disk space
-        shell: bash
-        run: |
-          echo "=== Disk space before cleanup ==="
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
-          sudo apt-get clean || true
-          docker system prune -af || true
-          echo "=== Disk space after cleanup ==="
-          df -h /
+      # Fix 1: Replace the slow manual `rm -rf` + `apt-get clean` + `docker prune`
+      # (which took 3+ minutes and only freed ~10GB) with easimon/maximize-build-space
+      # (frees 40-50GB in under 30 seconds by removing dotnet, android, haskell,
+      # codeql, and resizing the root partition).
+      - name: Maximize build disk space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -65,20 +70,45 @@ jobs:
           node -e "const m = require('@file-kiwi/node'); console.log('@file-kiwi/node exports:', Object.keys(m))"
           ffmpeg -version | head -1
 
-      - name: Download and upload
+      # Extract dispatch payload fields to GITHUB_ENV so later steps (including
+      # the cancellation handler, which runs with `if: cancelled()`) can access
+      # CHAT_ID_VAL without re-parsing the event JSON.
+      - name: Parse dispatch payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$EVENT_PAYLOAD" > /tmp/event.json
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            CHAT_ID_VAL=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.chat_id?String(p.chat_id):"")}catch(_){process.stdout.write("")}')
+            SERVICE_VAL=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.service||"")}catch(_){process.stdout.write("")}')
+          else
+            CHAT_ID_VAL=""
+            SERVICE_VAL="${{ inputs.service }}"
+          fi
+          [ -z "$SERVICE_VAL" ] && SERVICE_VAL="pixeldrain"
+          # Export to GITHUB_ENV so subsequent steps (incl. cancelled()) can read them
+          echo "CHAT_ID_VAL=$CHAT_ID_VAL" >> $GITHUB_ENV
+          echo "SERVICE_VAL=$SERVICE_VAL" >> $GITHUB_ENV
+          # Also save as step output for direct use within the upload step
+          echo "chat_id=$CHAT_ID_VAL" >> $GITHUB_OUTPUT
+          echo "service=$SERVICE_VAL" >> $GITHUB_OUTPUT
+          echo "===== PARSED PAYLOAD ====="
+          echo "chat_id  = $CHAT_ID_VAL"
+          echo "service  = $SERVICE_VAL"
+          echo "=========================="
         env:
           EVENT_PAYLOAD: ${{ toJSON(github.event) }}
+
+      - name: Download and upload
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "$EVENT_PAYLOAD" > /tmp/event.json
-
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             SOURCE=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.source_url||"")}catch(_){process.stdout.write("")}')
             FILENAME=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.filename||"")}catch(_){process.stdout.write("")}')
-            CHAT_ID_VAL=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.chat_id?String(p.chat_id):"")}catch(_){process.stdout.write("")}')
-            SERVICE_VAL=$(node -e 'const e=require("fs").readFileSync("/tmp/event.json","utf8");try{const p=JSON.parse(e).client_payload||{};process.stdout.write(p.service||"")}catch(_){process.stdout.write("")}')
+            CHAT_ID_VAL="$CHAT_ID_VAL"
+            SERVICE_VAL="$SERVICE_VAL"
             CALLBACK_VAL="$VERCEL_CALLBACK_URL"
           else
             SOURCE="${{ inputs.source }}"
@@ -205,5 +235,71 @@ jobs:
               -d "$PAYLOAD" || true
           fi
 
-          # Cleanup
-          rm -f result.json
+          # NOTE: result.json is intentionally NOT deleted here so the
+          # "Log disk space and upload details" step below can read it.
+
+      # Fix 7: Cancellation handler — when the user clicks "Cancel" in GitHub
+      # Actions UI, GitHub sends SIGTERM to the running process. With our new
+      # upload.mjs graceful-shutdown handler, the Node process exits within ~1s.
+      # This step then runs (`if: cancelled()`) and sends a cancellation
+      # callback to the Vercel bot so the user gets a clear "❌ Upload cancelled"
+      # message instead of waiting for the callback timeout.
+      - name: Handle cancellation
+        if: cancelled()
+        shell: bash
+        run: |
+          echo "::error::Workflow cancelled by user — cleanup complete"
+          echo "CHAT_ID_VAL=$CHAT_ID_VAL"
+          echo "SERVICE_VAL=$SERVICE_VAL"
+          if [ -n "$CHAT_ID_VAL" ] && [ -n "$VERCEL_CALLBACK_URL" ]; then
+            PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" SERVICE_VAL="$SERVICE_VAL" node -e 'console.log(JSON.stringify({status:"cancelled",chat_id:process.env.CHAT_ID_VAL,service:process.env.SERVICE_VAL,error:"Upload cancelled by user"}))')
+            echo "Sending cancellation callback to bot..."
+            curl -fsS -X POST "$VERCEL_CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Verify: $VERIFY_TOKEN" \
+              -d "$PAYLOAD" || echo "(callback failed — bot will show timeout instead)"
+          else
+            echo "(no chat_id — manual workflow run, no callback needed)"
+          fi
+
+      # Fix 6: Always-on logging step — captures final disk state and upload
+      # result for post-mortem debugging. Runs whether the job succeeded,
+      # failed, or was cancelled.
+      - name: Log disk space and upload details
+        if: always()
+        shell: bash
+        run: |
+          echo "=== Final Disk State ==="
+          df -h /
+          echo ""
+          echo "=== Work Dir Contents (if any) ==="
+          ls -lh /tmp/storageto/ 2>/dev/null || echo "(work dir already cleaned or never created)"
+          echo ""
+          echo "=== Upload Summary (result.json) ==="
+          if [ -f result.json ]; then
+            cat result.json
+            echo ""
+            echo "=== Parsed Key Fields ==="
+            node -e '
+              try {
+                const r = JSON.parse(require("fs").readFileSync("result.json","utf8"));
+                const m = r.main || {};
+                console.log("service:    ", m.service || "(missing)");
+                console.log("url:         ", m.url || "(missing)");
+                console.log("raw_url:     ", m.raw_url || "(missing)");
+                console.log("filename:    ", m.filename || "(missing)");
+                console.log("size:        ", m.human_size || "(missing)");
+                if (m.multi && Array.isArray(m.parts)) {
+                  console.log("multi-part:  ", m.parts.length, "parts");
+                  m.parts.forEach((p, i) => console.log(`  part ${i+1}: ${p.filename} (${p.human_size}) → ${p.url}`));
+                }
+              } catch (e) {
+                console.log("Could not parse result.json:", e.message);
+              }
+            '
+          else
+            echo "No result.json — upload did not complete successfully"
+          fi
+          echo ""
+          echo "=== Workflow Conclusion ==="
+          echo "job_status=${{ job.status }}"
