@@ -1,17 +1,20 @@
 {
-  "name": "storage-to-uploader",
-  "version": "1.0.0",
-  "description": "Anonymous uploads to [storage.to](https://storage.to) from GitHub Actions.",
-  "main": "index.js",
+  "name": "streamtobuffer-bot",
+  "version": "8.0.0",
+  "description": "Telegram bot: instant CDN stream via Gcore, or upload to pixeldrain / file.kiwi via GitHub Actions.",
+  "main": "upload.mjs",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo 'no test specified' && exit 0"
   },
   "repository": {
     "type": "git",
     "url": "https://github.com/AiCurv/storage-to-uploader.git"
   },
-  "keywords": [],
+  "keywords": ["telegram", "bot", "streaming", "gcore", "pixeldrain", "file.kiwi"],
   "author": "",
   "license": "ISC",
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "@file-kiwi/node": "^1.0.9"
+  }
 }

@@ -4,8 +4,8 @@
 //   /start              - Welcome message + main menu
 //   /upload <url>       - Upload a file URL (auto-asks which service)
 //   /raw <url>          - Same as /upload (kept for compatibility)
-//   /storage <url>      - Upload directly to storage.to (skip service picker)
 //   /pixeldrain <url>   - Upload directly to pixeldrain (skip service picker)
+//   /filekiwi <url>     - Upload directly to file.kiwi (skip service picker)
 //   /stream <url>       - Instant CDN Stream via Gcore (no download, returns streamable URL)
 //   /service            - Show / change default service
 //   /status             - Current settings (shows default service)
@@ -16,28 +16,31 @@
 //
 // Any direct URL sent as text triggers the service picker (inline keyboard).
 // Forwarded files (documents, videos, audio, photos) will be detected and prompted.
+//
+// v8.0: storage.to removed. Services are now: pixeldrain (10GB/file, persistent) and
+// file.kiwi (999GiB/file, 90h retention, E2E encrypted, anonymous). Default = pixeldrain.
 
 import { provisionStreamableUrl } from "./_gcore.js";
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
 
 const SERVICES = {
-  storageto:  { label: "📦 Storage.to", short: "storage.to",    emoji: "📦" },
-  pixeldrain: { label: "🎬 PixelDrain", short: "pixeldrain",    emoji: "🎬" },
+  pixeldrain: { label: "🎬 PixelDrain", short: "pixeldrain", emoji: "🎬" },
+  filekiwi:   { label: "🥝 file.kiwi",  short: "file.kiwi",   emoji: "🥝" },
 };
 
 const WELCOME = [
   "📦 <b>StreamToBuffer Bot</b>",
   "",
   "Send me any download link and I'll either:",
-  "  📦 <b>Upload</b> it to storage.to / pixeldrain (via GitHub Actions), or",
-  "  🚀 <b>Stream</b> it instantly via Gcore CDN (no download, no upload — instant streamable URL)",
+  "  🚀 <b>Stream</b> it instantly via Gcore CDN (no download, no upload — instant streamable URL), or",
+  "  📦 <b>Upload</b> it to pixeldrain or file.kiwi (via GitHub Actions)",
   "",
   "📝 <b>Commands:</b>",
-  "/upload &lt;url&gt; — Upload link (asks which service)",
-  "/storage &lt;url&gt; — Upload directly to storage.to",
-  "/pixeldrain &lt;url&gt; — Upload directly to pixeldrain",
   "/stream &lt;url&gt; — 🚀 Instant CDN stream (Gcore)",
+  "/upload &lt;url&gt; — Upload link (asks which service)",
+  "/pixeldrain &lt;url&gt; — Upload directly to pixeldrain",
+  "/filekiwi &lt;url&gt; — Upload directly to file.kiwi",
   "/service — Show / change default service",
   "/rename &lt;name&gt; — Set custom filename",
   "/status — Current settings",
@@ -53,21 +56,22 @@ const HELP_MSG = [
   "",
   "<b>Two ways to use a link:</b>",
   "",
-  "🚀 <b>Instant CDN Stream</b> (NEW — recommended for video):",
+  "🚀 <b>Instant CDN Stream</b> (recommended for video):",
   "• <b>/stream &lt;url&gt;</b> — returns an instant streamable URL via Gcore CDN",
   "• No download/upload — Gcore edge pulls from origin on-the-fly",
   "• Supports Range/seek (slice engine enabled)",
   "• Streams 12GB+ MKV/MP4 in VLC, Stremio, TV players",
-  "• Works with pixeldrain, storage.to, any direct download link",
+  "• Works with pixeldrain, R2 presigned, any direct download link",
   "",
-  "📦 <b>Upload services</b> (download + re-host):",
-  "• <b>storage.to</b> — anonymous, files expire after some time, max 25GB",
-  "• <b>pixeldrain</b> — requires account API key, files don't expire, max depends on plan",
+  "📦 <b>Upload services</b> (download + re-host via GitHub Actions):",
+  "• <b>pixeldrain</b> — persistent (60 days), max 10GB per file (auto-splits larger files)",
+  "• <b>file.kiwi</b> — anonymous, max 999 GiB, 90h retention, E2E encrypted",
   "",
   "<b>Supported sources:</b>",
   "• Any direct download link (mp4, mkv, zip, etc.)",
   "• Pixeldrain links (auto-converted to API link for download)",
-  "• hub.whistle.lat, hub.latent.click links",
+  "• hubcloud / hub.latent.click extractor links",
+  "• R2 / S3 / CloudFront presigned URLs (while still valid)",
   "• Any URL that serves file bytes directly",
   "",
   "<b>Forwarded files:</b>",
@@ -78,8 +82,8 @@ const HELP_MSG = [
   "<b>Commands:</b>",
   "/stream <url> — 🚀 Instant CDN stream (Gcore)",
   "/upload <url> — Upload a link (asks which service)",
-  "/storage <url> — Upload directly to storage.to",
-  "/pixeldrain <url> — Upload directly to pixeldrain",
+  "/pixeldrain <url> — Upload directly to pixeldrain (auto-splits >10GB)",
+  "/filekiwi <url> — Upload directly to file.kiwi (up to 999 GiB)",
   "/service — Show / change default service",
   "/raw <url> — Same as /upload",
   "/rename <name> — Override filename for next upload",
@@ -95,16 +99,17 @@ const ABOUT_MSG = [
   "",
   "🔧 <b>Tech Stack:</b>",
   "• Gcore CDN (instant streaming — slice engine, Range support, 200+ PoPs)",
-  "• GitHub Actions (download + upload for storage.to / pixeldrain)",
-  "• storage.to (file hosting, up to 25GB, anonymous)",
-  "• pixeldrain (file hosting, persistent, account-based)",
+  "• GitHub Actions (download + upload for pixeldrain / file.kiwi)",
+  "• pixeldrain (file hosting, persistent, max 10GB/file on free tier, auto-splits larger)",
+  "• file.kiwi (file hosting, anonymous, max 999 GiB, 90h retention, E2E encrypted)",
   "• Vercel (bot webhook handler + Gcore API orchestrator)",
   "",
   "⚡ <b>Features:</b>",
   "• 🚀 Instant CDN stream — no download, no upload, no storage used",
   "• Direct download passthrough — no conversion",
   "• Choose service per upload (inline keyboard)",
-  "• Files up to 25GB supported (storage.to)",
+  "• Files up to 999 GiB supported (file.kiwi)",
+  "• Auto-splitting for pixeldrain (files >10GB split with ffmpeg stream-copy)",
   "• Works with any direct download link",
   "• Forwarded Telegram files supported",
 ].join("\n");
@@ -127,7 +132,7 @@ function getUserSettings(chatId) {
   if (!userSettings[key]) {
     userSettings[key] = {
       nextFilename: null,
-      defaultService: "storageto", // default
+      defaultService: "pixeldrain", // v8.0: changed from storageto to pixeldrain
     };
   }
   return userSettings[key];
@@ -274,7 +279,7 @@ function filenameFromUrl(url) {
 }
 
 function isValidService(s) {
-  return s === "storageto" || s === "pixeldrain";
+  return s === "pixeldrain" || s === "filekiwi";
 }
 
 async function triggerUpload(sourceUrl, originalName, chatId, service) {
@@ -285,7 +290,7 @@ async function triggerUpload(sourceUrl, originalName, chatId, service) {
   const finalName = settings.nextFilename || originalName;
   settings.nextFilename = null;
 
-  const finalService = isValidService(service) ? service : settings.defaultService || "storageto";
+  const finalService = isValidService(service) ? service : settings.defaultService || "pixeldrain";
 
   const payload = {
     event_type: "telegram-upload",
@@ -531,16 +536,16 @@ function formatFileSize(bytes) {
 // ─── Service picker keyboard ───────────────────────────────────
 // Returns inline keyboard with all options. Uses pending-id so callback_data stays short.
 function servicePickerKeyboard(pendingId, currentService) {
-  const storagetoLabel  = currentService === "storageto"  ? "✅ 📦 Storage.to" : "📦 Storage.to";
   const pixeldrainLabel = currentService === "pixeldrain" ? "✅ 🎬 PixelDrain" : "🎬 PixelDrain";
+  const filekiwiLabel   = currentService === "filekiwi"   ? "✅ 🥝 file.kiwi"  : "🥝 file.kiwi";
   return {
     inline_keyboard: [
       [
         { text: "🚀 Stream (instant CDN)", callback_data: `pick_stream:${pendingId}` },
       ],
       [
-        { text: storagetoLabel,  callback_data: `pick_svc:${pendingId}:storageto` },
         { text: pixeldrainLabel, callback_data: `pick_svc:${pendingId}:pixeldrain` },
+        { text: filekiwiLabel,   callback_data: `pick_svc:${pendingId}:filekiwi` },
       ],
       [
         { text: "❌ Cancel", callback_data: `cancel_pending:${pendingId}` },
@@ -551,13 +556,13 @@ function servicePickerKeyboard(pendingId, currentService) {
 
 // Picker for /service command (no pending upload, just setting default)
 function defaultServicePickerKeyboard(currentService) {
-  const storagetoLabel  = currentService === "storageto"  ? "✅ 📦 Storage.to" : "📦 Storage.to";
   const pixeldrainLabel = currentService === "pixeldrain" ? "✅ 🎬 PixelDrain" : "🎬 PixelDrain";
+  const filekiwiLabel   = currentService === "filekiwi"   ? "✅ 🥝 file.kiwi"  : "🥝 file.kiwi";
   return {
     inline_keyboard: [
       [
-        { text: storagetoLabel,  callback_data: `set_def:storageto` },
         { text: pixeldrainLabel, callback_data: `set_def:pixeldrain` },
+        { text: filekiwiLabel,   callback_data: `set_def:filekiwi` },
       ],
     ],
   };
@@ -695,15 +700,14 @@ export default async function handler(req, res) {
       // Format: upload_file:<service>:<encoded_tgfile_url>:<encoded_filename>
       // OR legacy: upload_file:<encoded_tgfile_url>:<encoded_filename>
       const parts = data.split(":");
-      // parts[0] = "upload_file"
       let service, fileSourceUrl, fileName;
-      if (parts.length >= 4 && (parts[1] === "storageto" || parts[1] === "pixeldrain")) {
+      if (parts.length >= 4 && (parts[1] === "pixeldrain" || parts[1] === "filekiwi")) {
         service = parts[1];
         fileSourceUrl = decodeURIComponent(parts[2]);
         fileName = decodeURIComponent(parts.slice(3).join(":"));
       } else {
         // Legacy: no service in callback, use default
-        service = getUserSettings(chatId).defaultService || "storageto";
+        service = getUserSettings(chatId).defaultService || "pixeldrain";
         fileSourceUrl = decodeURIComponent(parts[1]);
         fileName = decodeURIComponent(parts.slice(2).join(":"));
       }
@@ -812,10 +816,10 @@ export default async function handler(req, res) {
     const encodedName = encodeURIComponent(fileInfo.file_name);
     const sizeStr = formatFileSize(fileInfo.file_size);
     const settings = getUserSettings(chatId);
-    const cur = settings.defaultService || "storageto";
+    const cur = settings.defaultService || "pixeldrain";
 
-    const storagetoLabel  = cur === "storageto"  ? "✅ 📦 Storage.to" : "📦 Storage.to";
     const pixeldrainLabel = cur === "pixeldrain" ? "✅ 🎬 PixelDrain" : "🎬 PixelDrain";
+    const filekiwiLabel   = cur === "filekiwi"   ? "✅ 🥝 file.kiwi"  : "🥝 file.kiwi";
 
     await sendMessage(chatId,
       `📎 <b>File detected!</b>\n\n` +
@@ -827,8 +831,8 @@ export default async function handler(req, res) {
         reply_markup: {
           inline_keyboard: [
             [
-              { text: storagetoLabel,  callback_data: `pick_svc_file:storageto:${encodedUrl}:${encodedName}` },
               { text: pixeldrainLabel, callback_data: `pick_svc_file:pixeldrain:${encodedUrl}:${encodedName}` },
+              { text: filekiwiLabel,   callback_data: `pick_svc_file:filekiwi:${encodedUrl}:${encodedName}` },
             ],
             [
               { text: "❌ Cancel", callback_data: "cancel_upload" },
@@ -871,7 +875,7 @@ export default async function handler(req, res) {
   // ─── Command: /service (no args) — show current + picker ───
   if (cleanText === "/service" || cleanText === "/service" ) {
     const settings = getUserSettings(chatId);
-    const cur = settings.defaultService || "storageto";
+    const cur = settings.defaultService || "pixeldrain";
     await sendMessage(
       chatId,
       `🔄 <b>Default Service</b>\n\n` +
@@ -885,7 +889,7 @@ export default async function handler(req, res) {
   // Persistent keyboard button "🔄 Service"
   if (text === "🔄 Service") {
     const settings = getUserSettings(chatId);
-    const cur = settings.defaultService || "storageto";
+    const cur = settings.defaultService || "pixeldrain";
     await sendMessage(
       chatId,
       `🔄 <b>Default Service</b>\n\n` +
@@ -901,10 +905,10 @@ export default async function handler(req, res) {
   if (serviceMatch) {
     const arg = serviceMatch[1].toLowerCase();
     let svc = null;
-    if (arg === "storageto" || arg === "storage.to" || arg === "storage_to" || arg === "storage") svc = "storageto";
     if (arg === "pixeldrain" || arg === "pixel" || arg === "pd") svc = "pixeldrain";
+    if (arg === "filekiwi" || arg === "file.kiwi" || arg === "kiwi" || arg === "fk") svc = "filekiwi";
     if (!svc) {
-      await sendMessage(chatId, "❌ Unknown service. Use <code>/service storageto</code> or <code>/service pixeldrain</code>", mainMenu());
+      await sendMessage(chatId, "❌ Unknown service. Use <code>/service pixeldrain</code> or <code>/service filekiwi</code>", mainMenu());
       return res.status(200).json({ ok: true });
     }
     const settings = getUserSettings(chatId);
@@ -917,7 +921,7 @@ export default async function handler(req, res) {
   if (cleanText === "/status") {
     const settings = getUserSettings(chatId);
     const nextName = settings.nextFilename ? `✏️ ${settings.nextFilename}` : "➖ Default (from URL)";
-    const cur = settings.defaultService || "storageto";
+    const cur = settings.defaultService || "pixeldrain";
     await sendMessage(chatId,
       `📊 <b>Current Settings</b>\n\n` +
       `Default service: ${SERVICES[cur].label}\n` +
@@ -971,7 +975,7 @@ export default async function handler(req, res) {
     // v7.6: embed URL in message text so we can recover it on callback even if the
     // in-memory pendingUploads Map was wiped by a Vercel cold start.
     const settings = getUserSettings(chatId);
-    const cur = settings.defaultService || "storageto";
+    const cur = settings.defaultService || "pixeldrain";
     const pendingId = createPendingUpload(sourceUrl, filename, chatId);
     await sendMessage(
       chatId,
@@ -990,17 +994,17 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   }
 
-  // ─── Command: /storage <url> ─── (direct to storage.to, no picker)
-  if (cleanText.startsWith("/storage ")) {
-    const urlPart = cleanText.replace(/^\/storage\s+/, "").trim();
-    await handleUrlUpload(urlPart, "storageto");
-    return res.status(200).json({ ok: true });
-  }
-
-  // ─── Command: /pixeldrain <url> ─── (direct to pixeldrain, no picker)
+  // ─── Command: /pixeldrain <url> ─── (direct to pixeldrain, no picker, auto-splits >10GB)
   if (cleanText.startsWith("/pixeldrain ")) {
     const urlPart = cleanText.replace(/^\/pixeldrain\s+/, "").trim();
     await handleUrlUpload(urlPart, "pixeldrain");
+    return res.status(200).json({ ok: true });
+  }
+
+  // ─── Command: /filekiwi <url> ─── (direct to file.kiwi, no picker, up to 999 GiB)
+  if (cleanText.startsWith("/filekiwi ")) {
+    const urlPart = cleanText.replace(/^\/filekiwi\s+/, "").trim();
+    await handleUrlUpload(urlPart, "filekiwi");
     return res.status(200).json({ ok: true });
   }
 
@@ -1027,7 +1031,6 @@ export default async function handler(req, res) {
       "<b>What works (all streamable, with pause/resume/seek):</b>\n" +
       "✅ Pixeldrain single file — <code>/stream https://pixeldrain.com/u/abc</code> (files never expire)\n" +
       "✅ Google video-downloads URLs (download-only links — GCore strips Content-Disposition: attachment)\n" +
-      "✅ storage.to raw URLs (download-only — same trick)\n" +
       "✅ R2 / S3 / CloudFront / Akamai / Bunny / Fastly presigned URLs (while still valid)\n" +
       "✅ Any direct download link (raw bytes + Range support)\n\n" +
       "<b>What doesn't work:</b>\n" +
@@ -1063,8 +1066,8 @@ export default async function handler(req, res) {
       "📎 Paste your download link below, or use:\n" +
       "<code>/stream URL</code> — 🚀 instant CDN stream (recommended for video)\n" +
       "<code>/upload URL</code> — pick service via inline button\n" +
-      "<code>/storage URL</code> — upload to storage.to directly\n" +
-      "<code>/pixeldrain URL</code> — upload to pixeldrain directly\n" +
+      "<code>/pixeldrain URL</code> — upload to pixeldrain directly (auto-splits >10GB)\n" +
+      "<code>/filekiwi URL</code> — upload to file.kiwi directly (up to 999 GiB)\n" +
       "<code>/rename name.mp4</code> — custom filename\n" +
       "<code>/service</code> — set default service",
       mainMenu()

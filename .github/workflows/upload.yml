@@ -1,4 +1,4 @@
-name: Upload to storage.to / pixeldrain
+name: Upload to pixeldrain / file.kiwi
 
 on:
   workflow_dispatch:
@@ -13,21 +13,23 @@ on:
         type: string
         default: ""
       service:
-        description: "Upload service: storageto | pixeldrain"
+        description: "Upload service: pixeldrain | filekiwi"
         required: false
         type: choice
-        default: "storageto"
+        default: "pixeldrain"
         options:
-          - storageto
           - pixeldrain
+          - filekiwi
 
 jobs:
   upload:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      STORAGE_TO_VISITOR_TOKEN: ${{ secrets.STORAGE_TO_VISITOR_TOKEN }}
       PIXELDRAIN_TOKEN: ${{ secrets.PIXELDRAIN_TOKEN }}
+      VERCEL_CALLBACK_URL: ${{ secrets.VERCEL_CALLBACK_URL }}
+      VERIFY_TOKEN: ${{ secrets.BOT_VERIFY_TOKEN }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,9 +37,12 @@ jobs:
       - name: Free disk space
         shell: bash
         run: |
+          echo "=== Disk space before cleanup ==="
+          df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
           sudo apt-get clean || true
           docker system prune -af || true
+          echo "=== Disk space after cleanup ==="
           df -h /
 
       - name: Setup Node
@@ -45,42 +50,45 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Run upload
-        id: upload
+      - name: Install @file-kiwi/node SDK + ffmpeg
+        shell: bash
+        run: |
+          echo "=== Installing @file-kiwi/node SDK (for file.kiwi uploads) ==="
+          npm install @file-kiwi/node --no-save 2>&1 | tail -3
+          echo ""
+          echo "=== Installing ffmpeg (for pixeldrain >10GB auto-splitting) ==="
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg 2>&1 | tail -3
+          echo ""
+          echo "=== Verify installs ==="
+          node -e "const m = require('@file-kiwi/node'); console.log('@file-kiwi/node exports:', Object.keys(m))"
+          ffmpeg -version | head -1
+
+      - name: Download and upload
+        env:
+          SOURCE_URL: ${{ inputs.source }}
+          FILENAME: ${{ inputs.filename }}
+          SERVICE_VAL: ${{ inputs.service }}
         shell: bash
         run: |
           set -euo pipefail
-          SERVICE_VAL="${{ inputs.service }}"
-          [ -z "$SERVICE_VAL" ] && SERVICE_VAL="storageto"
-          echo "Service: $SERVICE_VAL"
 
-          if [ "$SERVICE_VAL" = "pixeldrain" ] && [ -z "$PIXELDRAIN_TOKEN" ]; then
-            echo "::error::service=pixeldrain but PIXELDRAIN_TOKEN secret is not set"
-            exit 1
-          fi
+          SOURCE="$SOURCE_URL"
+          FILENAME="$FILENAME"
+          SERVICE_VAL="$SERVICE_VAL"
 
-          ARGS=( "${{ inputs.source }}" )
-          if [ -n "${{ inputs.filename }}" ]; then ARGS+=( "${{ inputs.filename }}" ); fi
+          [ -z "$SERVICE_VAL" ] && SERVICE_VAL="pixeldrain"
+
+          echo "===== MANUAL RUN ====="
+          echo "source   = $SOURCE"
+          echo "filename = $FILENAME"
+          echo "service  = $SERVICE_VAL"
+          echo "======================"
+
+          ARGS=( "$SOURCE" )
+          [ -n "$FILENAME" ] && ARGS+=( "$FILENAME" )
           ARGS+=( "" )
           ARGS+=( "$SERVICE_VAL" )
 
-          OUT=$(node upload.mjs "${ARGS[@]}" 2>&1 | tee /dev/stderr)
-          JSON=$(echo "$OUT" | sed -n '/RESULT_JSON_BEGIN/,/RESULT_JSON_END/p' | sed '1d;$d')
-          echo "$JSON" > result.json
-          URL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).main?.url||'')")
-          RAW=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).main?.raw_url||'')")
-          SVC=$(node -e "console.log(JSON.parse(require('fs').readFileSync('result.json','utf8')).main?.service||'$SERVICE_VAL')")
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "raw_url=$RAW" >> "$GITHUB_OUTPUT"
-          echo "service=$SVC" >> "$GITHUB_OUTPUT"
-          echo "::notice title=$SVC upload::$URL"
-          echo "::notice title=$SVC raw::$RAW"
+          echo "Running: node upload.mjs <url> '${FILENAME}' '' '${SERVICE_VAL}'"
 
-      - name: Persist result
-        if: always()
-        run: |
-          if [ -f result.json ]; then
-            echo "result.json (truncated):"
-            head -c 1200 result.json
-            echo
-          fi
+          node upload.mjs "${ARGS[@]}"

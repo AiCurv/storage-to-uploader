@@ -15,20 +15,19 @@ on:
         type: string
         default: ""
       service:
-        description: "Upload service: storageto | pixeldrain"
+        description: "Upload service: pixeldrain | filekiwi"
         required: false
         type: choice
-        default: "storageto"
+        default: "pixeldrain"
         options:
-          - storageto
           - pixeldrain
+          - filekiwi
 
 jobs:
   upload:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      STORAGE_TO_VISITOR_TOKEN: ${{ secrets.STORAGE_TO_VISITOR_TOKEN }}
       PIXELDRAIN_TOKEN: ${{ secrets.PIXELDRAIN_TOKEN }}
       VERCEL_CALLBACK_URL: ${{ secrets.VERCEL_CALLBACK_URL }}
       VERIFY_TOKEN: ${{ secrets.BOT_VERIFY_TOKEN }}
@@ -53,6 +52,19 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Install @file-kiwi/node SDK + ffmpeg
+        shell: bash
+        run: |
+          echo "=== Installing @file-kiwi/node SDK (for file.kiwi uploads) ==="
+          npm install @file-kiwi/node --no-save 2>&1 | tail -3
+          echo ""
+          echo "=== Installing ffmpeg (for pixeldrain >10GB auto-splitting) ==="
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg 2>&1 | tail -3
+          echo ""
+          echo "=== Verify installs ==="
+          node -e "const m = require('@file-kiwi/node'); console.log('@file-kiwi/node exports:', Object.keys(m))"
+          ffmpeg -version | head -1
+
       - name: Download and upload
         env:
           EVENT_PAYLOAD: ${{ toJSON(github.event) }}
@@ -76,9 +88,9 @@ jobs:
             CALLBACK_VAL=""
           fi
 
-          # Default service to storageto if missing/empty
+          # Default service to pixeldrain if missing/empty
           if [ -z "$SERVICE_VAL" ]; then
-            SERVICE_VAL="storageto"
+            SERVICE_VAL="pixeldrain"
           fi
 
           echo "===== DISPATCH PAYLOAD ====="
@@ -112,6 +124,7 @@ jobs:
             fi
             exit 1
           fi
+          # filekiwi needs no token (anonymous upload) — just needs @file-kiwi/node installed
 
           ARGS=( "$SOURCE" )
           [ -n "$FILENAME" ] && ARGS+=( "$FILENAME" )
@@ -142,36 +155,50 @@ jobs:
 
           echo "$JSON" > result.json
 
-          # Parse result
-          MAIN_URL=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.url||'')")
-          MAIN_RAW=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.raw_url||'')")
-          MAIN_FNAME=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.filename||'')")
-          MAIN_SIZE=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(String(r.main?.size||0))")
-          MAIN_HSIZE=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.human_size||'')")
-          MAIN_EXPIRES=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.expires_at||'')")
-          MAIN_SERVICE=$(node -e "const r=JSON.parse(require('fs').readFileSync('result.json','utf8'));process.stdout.write(r.main?.service||'$SERVICE_VAL')")
+          # Parse result — build full callback payload (including multi-part array if present)
+          # upload.mjs outputs: { main: { service, url, raw_url, filename, size, human_size, expires_at, multi?, parts? } }
+          # If main.multi=true and main.parts is an array, we pass parts through to the callback.
+          PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" RESULT_JSON_PATH="result.json" SERVICE_VAL="$SERVICE_VAL" node -e '
+            const fs = require("fs");
+            const r = JSON.parse(fs.readFileSync(process.env.RESULT_JSON_PATH, "utf8"));
+            const main = r.main || {};
+            const o = {
+              chat_id: process.env.CHAT_ID_VAL,
+              service: main.service || process.env.SERVICE_VAL,
+              url: main.url || "",
+              raw_url: main.raw_url || "",
+              filename: main.filename || "",
+              size_bytes: Number(main.size || 0),
+              human_size: main.human_size || "",
+              expires_at: main.expires_at || "",
+            };
+            // If multi-part upload (pixeldrain >10GB auto-split), pass parts array
+            if (main.multi && Array.isArray(main.parts)) {
+              o.parts = main.parts.map(p => ({
+                url: p.url || "",
+                raw_url: p.raw_url || "",
+                filename: p.filename || "",
+                size: Number(p.size || 0),
+                human_size: p.human_size || "",
+              }));
+            }
+            process.stdout.write(JSON.stringify(o));
+          ')
+
+          # Extract fields for GitHub Actions notices
+          MAIN_URL=$(echo "$PAYLOAD" | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0,'utf8')).url||'')")
+          MAIN_SERVICE=$(echo "$PAYLOAD" | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0,'utf8')).service||'')")
+          MAIN_FNAME=$(echo "$PAYLOAD" | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0,'utf8')).filename||'')")
+          MAIN_HSIZE=$(echo "$PAYLOAD" | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0,'utf8')).human_size||'')")
 
           echo "::notice title=service::$MAIN_SERVICE"
           echo "::notice title=$MAIN_SERVICE HTML::$MAIN_URL"
-          echo "::notice title=$MAIN_SERVICE raw::$MAIN_RAW"
           echo "::notice title=filename::$MAIN_FNAME"
           echo "::notice title=size::$MAIN_HSIZE"
+          echo "::notice title=payload::$PAYLOAD"
 
           # ── Callback to Vercel bot with results ──
           if [ -n "$CHAT_ID_VAL" ] && [ -n "$CALLBACK_VAL" ]; then
-            PAYLOAD=$(CHAT_ID_VAL="$CHAT_ID_VAL" URL="$MAIN_URL" RAW="$MAIN_RAW" FNAME="$MAIN_FNAME" SIZE="$MAIN_SIZE" HSIZE="$MAIN_HSIZE" EXPIRES="$MAIN_EXPIRES" SERVICE="$MAIN_SERVICE" node -e '
-              const o = {
-                chat_id: process.env.CHAT_ID_VAL,
-                service: process.env.SERVICE,
-                url: process.env.URL,
-                raw_url: process.env.RAW,
-                filename: process.env.FNAME,
-                size_bytes: Number(process.env.SIZE),
-                human_size: process.env.HSIZE,
-                expires_at: process.env.EXPIRES,
-              };
-              process.stdout.write(JSON.stringify(o));
-            ')
             curl -fsS -X POST "$CALLBACK_VAL" \
               -H "Content-Type: application/json" \
               -H "X-Verify: $VERIFY_TOKEN" \
