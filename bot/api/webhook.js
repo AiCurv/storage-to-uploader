@@ -34,23 +34,58 @@ import { provisionStreamableUrl, buildGcoreStreamUrl, extractPixeldrainId } from
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
 
+// v8.4: /start reply now includes INLINE BUTTONS for all secondary actions.
+// Per user spec: "only start one global command should auto-execute, others
+// should come on my inline". So /start is the single global command, and it
+// opens an inline button menu. No other command appears in the slash-menu
+// autocomplete. Users can still type /pixeldrain, /rename etc. manually if
+// they know them, but the primary UX is: /start → tap a button.
 const WELCOME = [
   "📦 <b>StreamToBuffer Bot</b>",
   "",
-  "Send me any download link and I'll:",
-  "  📦 <b>Upload</b> it to PixelDrain (via GitHub Actions, auto-splits &gt;10GB)",
-  "  ▶️ Give you <b>Stream</b> + <b>Download</b> buttons (Gcore CDN stream on tap)",
+  "Tap a button below, or just send me any download link.",
   "",
-  "📝 <b>Commands:</b>",
-  "/pixeldrain &lt;url&gt; — Upload to PixelDrain",
-  "/rename &lt;name&gt; — Set custom filename",
-  "/status — Current settings",
-  "/ping — Latency check",
-  "/help — Detailed help",
+  "📦 <b>Upload</b> — Send a link, then tap [Upload] to start",
+  "▶️ <b>Stream</b> — Gcore CDN streaming (button appears after upload)",
+  "✏️ <b>Rename</b> — Set custom filename for next upload",
   "",
   "💡 Works with ANY direct download link (R2 / S3 / presigned / pixeldrain / etc.)",
   "📎 You can also forward files directly to me!",
 ].join("\n");
+
+// Inline keyboard for the /start main menu.
+// callback_data must be ≤ 64 bytes.
+function startMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "📊 Status", callback_data: "menu:status" },
+        { text: "📖 Help", callback_data: "menu:help" },
+      ],
+      [
+        { text: "ℹ️ About", callback_data: "menu:about" },
+        { text: "🏓 Ping", callback_data: "menu:ping" },
+      ],
+      [
+        { text: "✏️ Rename next upload", callback_data: "menu:rename" },
+      ],
+    ],
+  };
+}
+
+// Inline keyboard for confirming an upload. Sent as a reply to the user's
+// URL message, so the callback handler can read the URL from
+// callback_query.message.reply_to_message.text.
+function confirmUploadKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "📦 Upload to PixelDrain", callback_data: "confirm_upload:yes" },
+        { text: "❌ Cancel", callback_data: "confirm_upload:no" },
+      ],
+    ],
+  };
+}
 
 const HELP_MSG = [
   "📖 <b>StreamToBuffer Help</b>",
@@ -145,16 +180,12 @@ async function answerCallbackQuery(callbackQueryId, text = "", opts = {}) {
   });
 }
 
+// v8.4: Removed persistent keyboard (mainMenu). Per user spec, the only
+// global command is /start; everything else is inline buttons. A persistent
+// keyboard would re-introduce the "tap a button → auto-execute" behavior the
+// user explicitly rejected.
 function mainMenu() {
-  return {
-    reply_markup: {
-      keyboard: [
-        [{ text: "🔗 Upload link" }, { text: "/status" }, { text: "/help" }, { text: "/ping" }],
-      ],
-      resize_keyboard: true,
-      is_persistent: true,
-    },
-  };
+  return {};
 }
 
 // Convert known "share page" URLs into direct download URLs (for SOURCE side)
@@ -585,6 +616,197 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
+    // ── Button: Confirm upload of a forwarded Telegram file ──
+    // v8.4: For forwarded files (no URL in user message), we stored the
+    // tgfile: URL in an HTML comment in the confirm message text. On tap,
+    // we parse it back out of cb.message.text.
+    // Format: confirm_tgfile:yes  or  confirm_tgfile:no
+    if (data.startsWith("confirm_tgfile:")) {
+      const choice = data.split(":")[1];
+
+      if (choice !== "yes") {
+        await answerCallbackQuery(cb.id, "❌ Cancelled");
+        try {
+          await fetch(`${TELEGRAM_API}/editMessageText`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: cb.message?.message_id,
+              text: "❌ <b>Upload cancelled.</b>",
+              parse_mode: "HTML",
+              disable_web_page_preview: true,
+            }),
+          });
+        } catch {}
+        return res.status(200).json({ ok: true });
+      }
+
+      // Extract tgfile: URL from the HTML comment in the confirm message
+      const msgText = cb.message?.text || cb.message?.caption || "";
+      const tgMatch = msgText.match(/<!-- tgfile_url: (.+?) -->/);
+      if (!tgMatch) {
+        await answerCallbackQuery(cb.id, "⚠️ Could not recover file");
+        await sendMessage(chatId,
+          "⚠️ <b>Could not recover the file reference.</b>\n\nPlease forward the file again.",
+          mainMenu());
+        return res.status(200).json({ ok: true });
+      }
+
+      const tgFileUrl = tgMatch[1].trim();
+      // Recover the filename from the tgfile: URL (format: tgfile:<id>:<name>)
+      const nameMatch = tgFileUrl.match(/^tgfile:[^:]+:(.+)$/);
+      const filename = nameMatch ? nameMatch[1] : "forwarded_file";
+
+      await answerCallbackQuery(cb.id, "⏳ Starting upload...");
+
+      // Edit the confirm message to show "processing"
+      try {
+        await fetch(`${TELEGRAM_API}/editMessageText`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: cb.message?.message_id,
+            text: `📥 <b>File added to queue</b>\n📦 <code>${escapeHtml(filename)}</code>\n🔄 Processing...`,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+          }),
+        });
+      } catch {}
+
+      (async () => {
+        try {
+          await triggerUpload(tgFileUrl, filename, chatId);
+        } catch (err) {
+          await sendMessage(chatId,
+            `❌ Failed to queue: <code>${escapeHtml(err.message).slice(0, 300)}</code>`,
+            mainMenu());
+        }
+      })();
+      return res.status(200).json({ ok: true });
+    }
+
+    // ── Button: Confirm upload (from URL message reply) ──
+    // v8.4: When user sends a URL, bot replies with [Upload][Cancel] as a reply
+    // to the user's message. When user taps [Upload], we read the original URL
+    // from callback_query.message.reply_to_message.text and dispatch.
+    // Format: confirm_upload:yes  or  confirm_upload:no
+    if (data.startsWith("confirm_upload:")) {
+      const choice = data.split(":")[1]; // "yes" or "no"
+
+      // Cancel path — just acknowledge and edit the message
+      if (choice !== "yes") {
+        await answerCallbackQuery(cb.id, "❌ Cancelled");
+        // Edit the original confirm message to show it was cancelled
+        try {
+          await fetch(`${TELEGRAM_API}/editMessageText`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: cb.message?.message_id,
+              text: "❌ <b>Upload cancelled.</b>",
+              parse_mode: "HTML",
+              disable_web_page_preview: true,
+            }),
+          });
+        } catch {}
+        return res.status(200).json({ ok: true });
+      }
+
+      // Confirm path — extract URL from the replied-to message
+      const originalText = cb.message?.reply_to_message?.text || "";
+      const sourceUrl = extractUrlFromText(originalText);
+      if (!sourceUrl) {
+        await answerCallbackQuery(cb.id, "⚠️ Could not find URL");
+        await sendMessage(chatId,
+          "⚠️ <b>Could not recover the URL.</b>\n\nPlease send the download link again.",
+          mainMenu());
+        return res.status(200).json({ ok: true });
+      }
+
+      // Acknowledge the callback immediately (<1s deadline)
+      await answerCallbackQuery(cb.id, "⏳ Starting upload...");
+
+      // Edit the confirm message to show "processing" state
+      const filename = filenameFromUrl(normalizeSourceUrl(sourceUrl) || sourceUrl);
+      try {
+        await fetch(`${TELEGRAM_API}/editMessageText`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: cb.message?.message_id,
+            text: `📥 <b>Download link added to queue</b>\n📦 <code>${escapeHtml(filename)}</code>\n🔄 Processing...`,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+          }),
+        });
+      } catch {}
+
+      // Dispatch to GitHub Actions (fire-and-forget)
+      (async () => {
+        try {
+          await triggerUpload(sourceUrl, filename, chatId);
+        } catch (err) {
+          await sendMessage(chatId,
+            `❌ Failed to queue: <code>${escapeHtml(err.message).slice(0, 300)}</code>`,
+            mainMenu());
+        }
+      })();
+      return res.status(200).json({ ok: true });
+    }
+
+    // ── Button: Main menu items (from /start) ──
+    // v8.4: /start shows inline buttons [Status][Help][About][Ping][Rename].
+    // These callbacks render the same content as the old /status, /help etc.
+    // commands, but triggered by a button tap instead of a typed command.
+    if (data.startsWith("menu:")) {
+      const action = data.slice(5);
+      if (action === "status") {
+        const settings = getUserSettings(chatId);
+        const nextName = settings.nextFilename
+          ? `✏️ ${escapeHtml(settings.nextFilename)}`
+          : "➖ Default (from URL)";
+        await answerCallbackQuery(cb.id, "📊 Status");
+        await sendMessage(chatId,
+          `📊 <b>Current Settings</b>\n\n` +
+          `Service: 🎬 PixelDrain (only option)\n` +
+          `Next filename: ${nextName}\n\n` +
+          `💡 Send a URL to upload!`,
+          { reply_markup: startMenuKeyboard() });
+        return res.status(200).json({ ok: true });
+      }
+      if (action === "help") {
+        await answerCallbackQuery(cb.id, "📖 Help");
+        await sendMessage(chatId, HELP_MSG, { reply_markup: startMenuKeyboard() });
+        return res.status(200).json({ ok: true });
+      }
+      if (action === "about") {
+        await answerCallbackQuery(cb.id, "ℹ️ About");
+        await sendMessage(chatId, ABOUT_MSG, { reply_markup: startMenuKeyboard() });
+        return res.status(200).json({ ok: true });
+      }
+      if (action === "ping") {
+        await answerCallbackQuery(cb.id, "🏓 Pong!");
+        await sendMessage(chatId,
+          `🏓 Pong! Bot is alive.\nServer time: ${new Date().toISOString()}`,
+          { reply_markup: startMenuKeyboard() });
+        return res.status(200).json({ ok: true });
+      }
+      if (action === "rename") {
+        await answerCallbackQuery(cb.id, "✏️ Rename");
+        await sendMessage(chatId,
+          `✏️ <b>Set custom filename</b>\n\n` +
+          `Reply to this message with the filename you want for your next upload.\n\n` +
+          `Example: <code>my_video.mp4</code>\n\n` +
+          `Or type: <code>/rename my_video.mp4</code>`,
+          { reply_markup: startMenuKeyboard() });
+        return res.status(200).json({ ok: true });
+      }
+    }
+
     // Unknown callback
     await answerCallbackQuery(cb.id, "");
     return res.status(200).json({ ok: true });
@@ -613,24 +835,47 @@ export default async function handler(req, res) {
   const text = (message.text || "").trim();
 
   // ─── Check for forwarded files FIRST ───
+  // v8.4: Forwarded files also get [Upload][Cancel] buttons instead of
+  // auto-dispatching. The file_id is encoded in a tgfile: URL which is stored
+  // in the replied-to message text (the bot's confirm message echoes it).
+  // Actually, since the user's original message doesn't contain a URL, we
+  // store the tgfile: URL in the bot's confirm message text itself and
+  // recover it from cb.message.text (not reply_to_message) on tap.
   const fileInfo = extractFileInfo(message);
   if (fileInfo && !text.startsWith("/")) {
     const tgFileUrl = `tgfile:${fileInfo.file_id}:${fileInfo.file_name}`;
     const sizeStr = formatFileSize(fileInfo.file_size);
-    await sendMessage(chatId,
+
+    // For forwarded files, we can't use reply_to_message to recover the URL
+    // (there is no URL in the user's message). Instead, we encode a short
+    // reference in callback_data. tgfile: URLs are too long for callback_data
+    // (64-byte limit), so we use a special prefix "confirm_tgfile" and store
+    // the file_id in the confirm message text. On tap, we parse the tgfile:
+    // URL from cb.message.text.
+    const confirmText =
       `📎 <b>File received</b>\n\n` +
       `Name: <code>${escapeHtml(fileInfo.file_name)}</code>\n` +
       `Size: ${sizeStr}\n\n` +
-      `📥 Download link added to queue. Processing...`,
-      mainMenu());
-    // Fire-and-forget dispatch
-    (async () => {
-      try {
-        await triggerUpload(tgFileUrl, fileInfo.file_name, chatId);
-      } catch (err) {
-        await sendMessage(chatId, `❌ Failed to queue: <code>${escapeHtml(err.message).slice(0, 300)}</code>`, mainMenu());
-      }
-    })();
+      `📦 <b>Confirm upload to PixelDrain?</b>\n\n` +
+      `<!-- tgfile_url: ${escapeHtml(tgFileUrl)} -->`;
+
+    await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: confirmText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_to_message_id: message.message_id,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "📦 Upload to PixelDrain", callback_data: "confirm_tgfile:yes" },
+            { text: "❌ Cancel", callback_data: "confirm_tgfile:no" },
+          ]],
+        },
+      }),
+    });
     return res.status(200).json({ ok: true });
   }
 
@@ -639,26 +884,30 @@ export default async function handler(req, res) {
   const cleanText = stripBotSuffix(text);
 
   // ─── Command: /start ───
+  // v8.4: /start is the ONLY global command. It opens an inline button menu.
   if (cleanText === "/start") {
-    await sendMessage(chatId, WELCOME, mainMenu());
+    await sendMessage(chatId, WELCOME, { reply_markup: startMenuKeyboard() });
     return res.status(200).json({ ok: true });
   }
 
   // ─── Command: /help ───
+  // v8.4: still works if typed manually, but NOT in slash-menu autocomplete.
   if (cleanText === "/help") {
-    await sendMessage(chatId, HELP_MSG, mainMenu());
+    await sendMessage(chatId, HELP_MSG, { reply_markup: startMenuKeyboard() });
     return res.status(200).json({ ok: true });
   }
 
   // ─── Command: /about ───
   if (cleanText === "/about") {
-    await sendMessage(chatId, ABOUT_MSG, mainMenu());
+    await sendMessage(chatId, ABOUT_MSG, { reply_markup: startMenuKeyboard() });
     return res.status(200).json({ ok: true });
   }
 
   // ─── Command: /ping ───
   if (cleanText === "/ping") {
-    await sendMessage(chatId, `🏓 Pong! Bot is alive.\nServer time: ${new Date().toISOString()}`, mainMenu());
+    await sendMessage(chatId,
+      `🏓 Pong! Bot is alive.\nServer time: ${new Date().toISOString()}`,
+      { reply_markup: startMenuKeyboard() });
     return res.status(200).json({ ok: true });
   }
 
@@ -671,7 +920,7 @@ export default async function handler(req, res) {
       `Service: 🎬 PixelDrain (only option)\n` +
       `Next filename: ${nextName}\n\n` +
       `💡 Send a URL to upload!`,
-      mainMenu());
+      { reply_markup: startMenuKeyboard() });
     return res.status(200).json({ ok: true });
   }
 
@@ -688,90 +937,100 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   }
 
-  // ─── Helper: kick off upload flow for a URL ───
-  // v8.2: no service picker — go straight to PixelDrain.
-  async function handleUrlUpload(urlPart) {
+  // ─── Helper: show [Upload][Cancel] inline buttons for a URL ───
+  // v8.4 FIX: This replaces the old handleUrlUpload() which auto-dispatched
+  // to GitHub Actions immediately. Per user spec, NOTHING should auto-execute
+  // — the user must tap [Upload] first. The bot replies to the user's URL
+  // message with a confirm keyboard, and the confirm_upload callback handler
+  // reads the URL back from callback_query.message.reply_to_message.text.
+  async function showUploadConfirmation(urlPart) {
     if (!looksLikeUrl(urlPart)) {
-      await sendMessage(chatId, "❌ Provide a valid URL.\nExample: <code>/pixeldrain https://example.com/file.mkv</code>", mainMenu());
+      await sendMessage(chatId,
+        "❌ Provide a valid URL.\nExample: <code>https://example.com/file.mkv</code>",
+        { reply_markup: startMenuKeyboard() });
       return;
     }
     const sourceUrl = normalizeSourceUrl(urlPart) || urlPart;
     const filename = filenameFromUrl(sourceUrl);
 
-    // v8.2: single "queued" message — no further intermediate messages.
-    // The final consolidated result message comes from /api/result when the
-    // GitHub Actions run completes.
-    await sendMessage(chatId,
-      `📥 <b>Download link added to queue</b>\n` +
-      `📦 <code>${escapeHtml(filename)}</code>\n` +
-      `🔄 Processing...`,
-      mainMenu());
-
-    // Fire-and-forget dispatch — return HTTP 200 immediately.
-    (async () => {
-      try {
-        await triggerUpload(sourceUrl, filename, chatId);
-        // No "dispatched" follow-up message per spec ("NO intermediate 'uploading' messages")
-      } catch (err) {
-        await sendMessage(chatId, `❌ Failed to queue: <code>${escapeHtml(err.message).slice(0, 300)}</code>`, mainMenu());
-      }
-    })();
+    // Reply TO the user's message so we can recover the URL on button tap
+    await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text:
+          `📦 <b>Confirm upload?</b>\n\n` +
+          `🔗 <code>${escapeHtml(sourceUrl).slice(0, 300)}</code>\n` +
+          `📝 Filename: <code>${escapeHtml(filename)}</code>\n\n` +
+          `Tap <b>Upload</b> to send to PixelDrain (auto-splits &gt;10GB).`,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_to_message_id: message.message_id,
+        reply_markup: confirmUploadKeyboard(),
+      }),
+    });
   }
 
-  // ─── Command: /pixeldrain <url> ─── (direct to PixelDrain, auto-splits >10GB)
+  // ─── Command: /pixeldrain <url> ───
+  // v8.4: NO LONGER auto-dispatches. Shows [Upload][Cancel] buttons instead.
   if (cleanText.startsWith("/pixeldrain ")) {
     const urlPart = cleanText.replace(/^\/pixeldrain\s+/, "").trim();
-    await handleUrlUpload(urlPart);
+    await showUploadConfirmation(urlPart);
     return res.status(200).json({ ok: true });
   }
 
   // ─── Legacy commands: /upload, /raw, /filekiwi, /stream, /service ───
-  // v8.2: removed. Reply with redirect to /pixeldrain or plain URL.
+  // v8.4: still no auto-execute. If they contain a URL, show confirm buttons.
   if (cleanText.startsWith("/upload ") || cleanText.startsWith("/raw ") || cleanText.startsWith("/filekiwi ") || cleanText.startsWith("/stream ") || cleanText.startsWith("/service")) {
-    // For /upload <url>, /raw <url>, /filekiwi <url>, /stream <url>: extract URL and dispatch to PixelDrain
     const urlMatch = cleanText.match(/https?:\/\/\S+/i);
     if (urlMatch) {
-      await handleUrlUpload(urlMatch[0]);
+      await showUploadConfirmation(urlMatch[0]);
     } else {
       await sendMessage(chatId,
         `💡 <b>Command simplified</b>\n\n` +
         `Just send the URL directly, or use <code>/pixeldrain &lt;url&gt;</code>.\n\n` +
         `All uploads go to PixelDrain (auto-splits &gt;10GB). Stream buttons appear in the result message.`,
-        mainMenu());
+        { reply_markup: startMenuKeyboard() });
     }
     return res.status(200).json({ ok: true });
   }
 
-  // ─── Menu button: "🔗 Upload link" ───
+  // ─── Menu button: "🔗 Upload link" (legacy persistent keyboard — removed in v8.4) ───
+  // Kept for backwards compat if a user still has the old keyboard cached.
   if (text === "🔗 Upload link") {
     await sendMessage(
       chatId,
       "📎 <b>Send me a download link</b>\n\n" +
-      "Just paste any direct download URL and I'll upload it to PixelDrain.\n" +
+      "Just paste any direct download URL and I'll show you [Upload] [Cancel] buttons.\n" +
       "Files &gt; 10GB are auto-split with an M3U playlist.\n\n" +
       "<b>Example:</b>\n" +
-      "<code>/pixeldrain https://example.com/file.mkv</code>\n\n" +
+      "<code>https://example.com/file.mkv</code>\n\n" +
       "<code>/rename name.mp4</code> — custom filename",
-      mainMenu()
+      { reply_markup: startMenuKeyboard() }
     );
     return res.status(200).json({ ok: true });
   }
 
   // ─── Unknown commands ───
   if (text.startsWith("/")) {
-    await sendMessage(chatId, "❓ Unknown command. Try /help for available commands.", mainMenu());
+    await sendMessage(chatId,
+      "❓ Unknown command. Tap /start for the menu.",
+      { reply_markup: startMenuKeyboard() });
     return res.status(200).json({ ok: true });
   }
 
-  // ─── Auto-detect URL in message → upload to PixelDrain directly ───
+  // ─── Auto-detect URL in message → show [Upload][Cancel] buttons (v8.4: NO auto-dispatch) ───
   const detectedUrl = extractUrlFromText(text);
   if (detectedUrl) {
-    await handleUrlUpload(detectedUrl);
+    await showUploadConfirmation(detectedUrl);
     return res.status(200).json({ ok: true });
   }
 
   // ─── Non-URL text ───
-  await sendMessage(chatId, "📎 Send a download URL and I'll upload it to PixelDrain.\n\nType /help for more info.", mainMenu());
+  await sendMessage(chatId,
+    "📎 Send a download URL and I'll show you [Upload] [Cancel] buttons.\n\nTap /start for the menu.",
+    { reply_markup: startMenuKeyboard() });
   return res.status(200).json({ ok: true });
 }
 

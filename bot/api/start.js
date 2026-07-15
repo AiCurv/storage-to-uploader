@@ -39,14 +39,19 @@ export default async function handler(req, res) {
   results.webhook = { url: webhookUrl, telegram: await wh.json() };
 
   // 2. Set bot commands menu
-  // v8.2: removed /stream, /upload, /filekiwi, /service, /raw — only /pixeldrain + utility commands
+  // v8.4 FIX (per user): "only start one global command should auto-execute,
+  //   others should come on my inline" — so ONLY /start is registered globally.
+  //   All other functionality (upload, rename, status, help, about, ping) is
+  //   exposed as INLINE BUTTONS in the /start reply. Users can still type
+  //   /pixeldrain, /rename etc. manually if they know them, but they will NOT
+  //   appear in the slash-menu autocomplete.
+  //
+  // Why: when 6 commands are global, tapping any of them from the "/" menu
+  // fires the command immediately (auto-executes). The user wants a single
+  // entry point (/start) that opens an inline button menu, so nothing happens
+  // without an explicit button tap.
   const commands = [
-    { command: "pixeldrain", description: "Upload to PixelDrain (auto-splits >10GB)" },
-    { command: "rename", description: "Set custom filename for next upload" },
-    { command: "status", description: "Check current settings" },
-    { command: "ping", description: "Check bot latency" },
-    { command: "about", description: "About this bot" },
-    { command: "help", description: "Detailed help & info" },
+    { command: "start", description: "Open main menu" },
   ];
   const cmdRes = await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
     method: "POST",
@@ -61,12 +66,13 @@ export default async function handler(req, res) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       description:
-        "📦 StreamToBuffer Bot — Send me any file link and I'll upload it to PixelDrain (auto-splits >10GB) with Stream + Download buttons!\n\n" +
+        "📦 StreamToBuffer Bot — Tap /start to open the menu, then send any link and tap Upload to send it to PixelDrain (auto-splits >10GB) with Stream + Download buttons!\n\n" +
         "✨ Features:\n" +
-        "• /pixeldrain URL — upload to PixelDrain (auto-splits >10GB with M3U playlist)\n" +
+        "• /start → inline button menu (Upload / Status / Help / About / Rename)\n" +
+        "• Send any URL → [Upload] [Cancel] inline buttons (no auto-execute)\n" +
         "• Stream button — instant Gcore CDN stream (no download, no upload)\n" +
         "• Forwarded Telegram files supported\n\n" +
-        "Just send a URL to get started!",
+        "Tap /start to begin!",
     }),
   });
 
@@ -75,7 +81,7 @@ export default async function handler(req, res) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      short_description: "📦 PixelDrain uploader + ▶️ Gcore CDN stream (auto-splits >10GB)",
+      short_description: "📦 PixelDrain uploader + ▶️ Gcore CDN stream (tap /start)",
     }),
   });
 
