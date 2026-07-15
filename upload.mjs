@@ -370,8 +370,26 @@ function splitFileForUpload(filePath, baseFilename, maxBytes) {
 
     partPrefix = `${stem}_part_`;
     const partPattern = join(WORK_DIR, `${partPrefix}%03d${ext}`);
-    const cmd = `ffmpeg -y -i "${filePath}" -c copy -f segment -segment_time ${segmentTime} -reset_timestamps 1 "${partPattern}"`;
-    log(`[split] running ffmpeg segment...`);
+    // v8.3: -map 0 forces ffmpeg to include ALL streams from the input (every
+    // audio track, every subtitle track, attachments). Without -map 0, ffmpeg's
+    // default stream-selection logic can drop streams it considers "redundant"
+    // — particularly:
+    //   - The 2nd audio track in multi-audio REMUX files (e.g., Hindi + English
+    //     TrueHD Atmos) — only the first audio track would survive.
+    //   - Subtitle streams (especially ASS/SSA, PGS) — silently dropped.
+    //   - Attachment streams (fonts for ASS subtitles) — silently dropped.
+    // -map 0 -c copy preserves EVERY stream with no re-encoding.
+    //
+    // -segment_format matroska: explicitly tells the segment muxer to use
+    // Matroska container for each part (matches the input .mkv). Without this,
+    // ffmpeg may auto-select a different container that doesn't support all
+    // stream types.
+    //
+    // -segment_format_options=reserve_index_space=0: disables Matroska's
+    // default 1MB index reservation per segment (saves disk space).
+    const cmd = `ffmpeg -y -i "${filePath}" -map 0 -c copy -f segment -segment_time ${segmentTime} -reset_timestamps 1 -segment_format matroska -segment_format_options=reserve_index_space=0 "${partPattern}"`;
+    log(`[split] running ffmpeg segment with -map 0 (preserve all audio + subtitles)...`);
+    log(`[split] cmd: ${cmd}`);
 
     try {
       execSync(cmd, { stdio: ["pipe", "pipe", "pipe"], timeout: 1800_000 }); // 30 min max

@@ -1,15 +1,19 @@
 // Called by GitHub Actions workflow when upload finishes.
 // Body: { chat_id, service, url, raw_url, filename, size_bytes, human_size, expires_at, error, parts }
 //
-// v8.2: Sends ONE consolidated message with inline buttons:
+// v8.3: Sends ONE consolidated message with inline buttons:
 //   - Single file (<10GB): filename + size + buttons [📂 Open] [▶️ Stream] [📋 Copy]
 //   - Multi-part (≥10GB): filename + total size + part count + M3U file attached
 //                         + buttons [📋 Copy M3U] [▶️ Stream All] [📂 Download All]
-//                         + list of parts with their PixelDrain URLs
+//                         + list of parts with their PixelDrain + GCore URLs
 //
-// Stream button lazily provisions a Gcore CDN URL on click (handled in webhook.js).
-// M3U uses PixelDrain raw URLs (not Gcore) because the single-CDN-resource
-// architecture means Gcore can only point at one origin at a time.
+// Stream button lazily constructs a Gcore CDN URL on click (handled in webhook.js).
+// v8.3: M3U uses Gcore CDN URLs (https://{GCORE_CDN_CNAME}/api/file/{id}) for ALL
+// parts — the CDN origin is permanently pixeldrain.com, so each part streams
+// through the GCore edge with caching + IP rate limit bypass. All parts can be
+// streamed concurrently (no origin repointing conflict).
+
+import { buildGcoreStreamUrl, extractPixeldrainId } from "./_gcore.js";
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
 
@@ -65,16 +69,17 @@ function escapeHtml(s) {
  * Extract the pixeldrain file ID from a URL like:
  *   https://pixeldrain.com/u/ABC12345
  *   https://pixeldrain.com/api/file/ABC12345
+ * (re-exported from _gcore.js for backwards compat with any internal callers)
  */
-function extractPixeldrainId(url) {
-  if (!url) return null;
-  const m = url.match(/\/(?:u|api\/file|d)\/([A-Za-z0-9]+)/);
-  return m ? m[1] : null;
+function extractPixeldrainIdLocal(url) {
+  return extractPixeldrainId(url);
 }
 
 /**
  * Build the M3U playlist content for multi-part uploads.
- * Uses pixeldrain raw URLs (they support Range and stream in VLC).
+ * v8.3: Uses Gcore CDN URLs (https://{GCORE_CDN_CNAME}/api/file/{id}) for ALL parts.
+ * The CDN origin is permanently pixeldrain.com, so each /api/file/{id} request
+ * routes through the GCore edge with caching + IP rate limit bypass.
  */
 function buildM3UContent(filename, parts) {
   const lines = [
@@ -85,8 +90,15 @@ function buildM3UContent(filename, parts) {
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i];
     const partName = p.filename || `Part ${i + 1}`;
+    const pid = extractPixeldrainId(p.url) || extractPixeldrainId(p.raw_url);
     lines.push(`#EXTINF:-1,${partName}`);
-    lines.push(p.raw_url || p.url || "");
+    if (pid) {
+      // GCore CDN URL — edge cached, IP rate limit bypass, streaming headers applied
+      lines.push(buildGcoreStreamUrl(pid));
+    } else {
+      // Fallback: pixeldrain raw URL (shouldn't happen, but just in case)
+      lines.push(p.raw_url || p.url || "");
+    }
   }
   lines.push("#EXT-X-ENDLIST");
   return lines.join("\n");

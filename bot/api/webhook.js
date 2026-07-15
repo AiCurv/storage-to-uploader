@@ -1,6 +1,6 @@
 // Telegram webhook entrypoint. Vercel invokes this on every incoming message.
 //
-// v8.2 architecture (per user spec 2026-07-15):
+// v8.3 architecture (per user spec 2026-07-15):
 //   - ONLY PixelDrain as upload service (file.kiwi + storage.to removed)
 //   - ONLY Gcore CDN as streaming layer (no /stream command — consolidated into post-upload buttons)
 //   - Single consolidated message on upload completion (no cascade of intermediate messages)
@@ -8,13 +8,15 @@
 //                         Copy M3U / Stream All / Download All  (multi-part)
 //   - /pixeldrain <url> and plain-URL messages both dispatch silently after a single
 //     "📥 Download link added to queue. Processing..." message
-//   - Stream button lazily provisions a Gcore CDN URL on click (answers callback
+//   - Stream button lazily constructs a Gcore CDN URL on click (answers callback
 //     query in <1s, then sends the stream URL as a new message)
-//   - Multi-part M3U uses PixelDrain raw URLs (not Gcore) because the single
-//     Gcore CDN resource can only point at one origin at a time — using Gcore
-//     URLs in the M3U would make all parts resolve to the last-provisioned part.
-//     This is the "GCore link generation fails → fall back to PixelDrain" case
-//     from the spec.
+//   - Multi-part M3U uses Gcore CDN URLs (https://{GCORE_CDN_CNAME}/api/file/{id})
+//     for ALL parts. The CDN resource's origin is PERMANENTLY set to pixeldrain.com
+//     so every /api/file/{id} request routes through GCore edge with caching +
+//     IP rate limit bypass. No origin repointing needed per request.
+//   - Previous v8.2 assumption ("GCore can only point at one origin at a time →
+//     M3U must use PixelDrain raw URLs") was WRONG. The user explicitly verified
+//     GCore supports path-based routing for multiple parts via a single resource.
 //
 // Commands:
 //   /start              - Welcome message + main menu
@@ -28,7 +30,7 @@
 // Any direct URL sent as text triggers upload to PixelDrain (no picker).
 // Forwarded files (documents, videos, audio, photos) are also uploaded.
 
-import { provisionStreamableUrl } from "./_gcore.js";
+import { provisionStreamableUrl, buildGcoreStreamUrl, extractPixeldrainId } from "./_gcore.js";
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
 
@@ -316,18 +318,19 @@ function formatFileSize(bytes) {
   return `${bytes.toFixed(i > 0 ? 1 : 0)} ${u[i]}`;
 }
 
-// ─── On-demand Gcore stream provisioning (button-powered) ────
+// ─── On-demand Gcore stream URL construction (button-powered) ────
+//
+// v8.3: The CDN resource's origin is PERMANENTLY set to pixeldrain.com.
+// No origin repointing is needed — we just construct the GCore URL for the pixeldrain ID.
+// This means multiple parts can ALL be streamed concurrently (each has its own
+// /api/file/{id} URL on the same CDN edge), with edge caching + IP rate limit bypass.
 //
 // When the user taps "▶️ Stream" or "▶️ Stream Part N", we:
 //   1. answerCallbackQuery IMMEDIATELY (clears the button spinner in <1s)
-//   2. send a "⏳ Provisioning Gcore stream..." message so user has feedback
+//   2. send a "⏳ Constructing Gcore stream URL..." message so user has feedback
 //   3. call provisionStreamableUrl(pixeldrain_raw_url) in the background
 //   4. on success → send a new message with the Gcore stream URL
 //   5. on failure → send a new message with the PixelDrain raw URL as fallback
-//
-// NOTE: Gcore's single-CDN-resource architecture means each /stream call repoints
-// the CDN at the latest origin. So if user streams Part 1 then Part 2, the Part 1
-// URL will now serve Part 2's content. We warn the user about this in the message.
 
 async function provisionAndSendStreamUrl(chatId, pixeldrainRawUrl, label, callbackQueryId) {
   // Already answered the callback query before calling this — no need to answer again.
@@ -344,8 +347,8 @@ async function provisionAndSendStreamUrl(chatId, pixeldrainRawUrl, label, callba
         "• Pause / resume / seek all work",
         "• First byte may take ~2-5s (cache warm-up)",
         "",
-        "⚠️ <b>Important:</b> each new Stream tap repoints the CDN at the latest part.",
-        "If you stream multiple parts, only the LAST one will work at any given time.",
+        "✅ <b>Multi-part friendly:</b> each part has its own URL on the CDN edge.",
+        "Stream different parts concurrently — no repointing conflict.",
       ];
       if (r.presignedExpiresAt) {
         const expiryDate = new Date(r.presignedExpiresAt);
@@ -371,6 +374,15 @@ async function provisionAndSendStreamUrl(chatId, pixeldrainRawUrl, label, callba
     if (r.kind === "pixeldrain_list") {
       await sendMessage(chatId,
         `📋 <b>PixelDrain list — not a single file</b>\n\nOpen the list, click a file, copy its /u/<id> URL and try again.\n\nFallback:\n${pixeldrainRawUrl}`,
+        mainMenu());
+      return;
+    }
+    if (r.kind === "non_pixeldrain_url") {
+      // v8.3: CDN origin is permanently pixeldrain.com, can't stream non-pixeldrain URLs
+      await sendMessage(chatId,
+        `⚠️ <b>Cannot stream this URL directly</b>\n\n` +
+        `The CDN is configured for PixelDrain only. To stream this file, upload it to PixelDrain first.\n\n` +
+        `Original URL:\n<code>${escapeHtml(r.originalUrl).slice(0, 300)}</code>`,
         mainMenu());
       return;
     }
@@ -508,14 +520,12 @@ export default async function handler(req, res) {
 
     // ── Button: Stream All (multi-part) ──
     // Format: stream_all:<num_parts>
-    // Sends a new message with per-part stream buttons (because Gcore can only
-    // point at one origin at a time, we can't stream all parts concurrently —
-    // user taps each part they want to stream).
+    // v8.3: Since the CDN origin is PERMANENTLY pixeldrain.com and each part has
+    // its own /api/file/{id} URL on the CDN edge, we can stream ALL parts
+    // concurrently — no repointing conflict. Send all stream URLs in one message.
     if (data.startsWith("stream_all:")) {
       const numParts = parseInt(data.split(":")[1], 10);
-      await answerCallbackQuery(cb.id, "▶️ Pick a part to stream");
-      // We need the part IDs to build per-part buttons. They're not in callback_data
-      // (too long for 64-byte limit). We recover them from the original message text.
+      await answerCallbackQuery(cb.id, "▶️ Stream URLs ready below 👇");
       const msgText = cb.message?.text || cb.message?.caption || "";
       const ids = extractPixeldrainIdsFromMessage(msgText, numParts);
       if (ids.length === 0) {
@@ -524,22 +534,21 @@ export default async function handler(req, res) {
           mainMenu());
         return res.status(200).json({ ok: true });
       }
-      // Build inline keyboard with one button per part (4 per row)
-      const rows = [];
-      let row = [];
+      // Build a single message with all GCore stream URLs
+      const lines = [`▶️ <b>Gcore Stream URLs — ${ids.length} parts</b>`, ``];
       for (let i = 0; i < ids.length; i++) {
-        row.push({ text: `▶️ Part ${i + 1}`, callback_data: `stream_part:${i + 1}:${ids[i]}` });
-        if (row.length === 3 || i === ids.length - 1) {
-          rows.push(row);
-          row = [];
-        }
+        const streamUrl = buildGcoreStreamUrl(ids[i]);
+        lines.push(`<b>Part ${i + 1}/${ids.length}:</b>`);
+        lines.push(`<a href="${streamUrl}">${streamUrl}</a>`);
+        lines.push(``);
       }
-      await sendMessage(chatId,
-        `▶️ <b>Stream All — pick a part</b>\n\n` +
-        `Gcore CDN can only stream one part at a time (single-resource architecture).\n` +
-        `Tap a part button below to provision a stream URL for that part.\n\n` +
-        `⚠️ Each tap repoints the CDN — previous stream URLs will serve the new part's content.`,
-        { reply_markup: { inline_keyboard: rows } });
+      lines.push(`📱 <b>How to use:</b>`);
+      lines.push(`• Paste each URL into VLC / Stremio / TV media player`);
+      lines.push(`• Each part streams independently — play them in order`);
+      lines.push(`• First byte may take ~2-5s (cache warm-up)`);
+      lines.push(``);
+      lines.push(`<i>Long-press any URL → Copy</i>`);
+      await sendMessage(chatId, lines.join("\n"), mainMenu());
       return res.status(200).json({ ok: true });
     }
 
@@ -566,10 +575,10 @@ export default async function handler(req, res) {
           `📋 <b>M3U Playlist (${ids.length} parts):</b>\n\n<code>${escapeHtml(m3u)}</code>\n\n<i>Long-press → Copy. Paste into a .m3u file, or send to VLC.</i>`,
           mainMenu());
       } else {
-        // Too long — send URLs only
+        // Too long — send URLs only (GCore CDN URLs for streaming)
         const lines = [`📋 <b>M3U URLs (M3U too long for chat — use attached .m3u file):</b>`, ``];
         for (let i = 0; i < ids.length; i++) {
-          lines.push(`Part ${i + 1}: <code>https://pixeldrain.com/api/file/${ids[i]}</code>`);
+          lines.push(`Part ${i + 1}: <code>${buildGcoreStreamUrl(ids[i])}</code>`);
         }
         await sendMessage(chatId, lines.join("\n"), mainMenu());
       }
@@ -792,10 +801,10 @@ function extractPixeldrainIdsFromMessage(messageText, expectedCount) {
 
 /**
  * Build an M3U playlist from pixeldrain IDs.
- * Uses pixeldrain raw URLs (/api/file/<id>) because they support Range requests
- * and stream correctly in VLC. We CANNOT use Gcore URLs here because the single
- * Gcore CDN resource can only point at one origin at a time — all parts would
- * resolve to the last-provisioned part.
+ * v8.3: Uses Gcore CDN URLs (https://{GCORE_CDN_CNAME}/api/file/{id}) for ALL parts.
+ * The CDN resource's origin is permanently set to pixeldrain.com, so each
+ * /api/file/{id} request routes through the GCore edge with caching +
+ * IP rate limit bypass. All parts can be streamed concurrently.
  *
  * @param {string[]} ids - pixeldrain file IDs
  * @param {string} messageText - original message (for filename hints)
@@ -812,7 +821,7 @@ function buildM3U(ids, messageText) {
   for (let i = 0; i < ids.length; i++) {
     const partName = nameMatches[i] ? nameMatches[i][1].trim() : `Part ${i + 1}`;
     lines.push(`#EXTINF:-1,${partName}`);
-    lines.push(`https://pixeldrain.com/api/file/${ids[i]}`);
+    lines.push(buildGcoreStreamUrl(ids[i]));  // GCore CDN URL
   }
   lines.push("#EXT-X-ENDLIST");
   return lines.join("\n");
