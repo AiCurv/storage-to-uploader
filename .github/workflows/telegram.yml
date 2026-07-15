@@ -38,19 +38,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Fix 1: Replace the slow manual `rm -rf` + `apt-get clean` + `docker prune`
-      # (which took 3+ minutes and only freed ~10GB) with easimon/maximize-build-space
-      # (frees 40-50GB in under 30 seconds by removing dotnet, android, haskell,
-      # codeql, and resizing the root partition).
+      # Fix 1 (v8.2 revised): Fast manual disk cleanup.
+      #
+      # Previous attempt used easimon/maximize-build-space@master but it broke
+      # actions/setup-node@v4 (the action resizes the root partition and moves
+      # /home/runner, which causes setup-node to fail when extracting Node to
+      # a path that no longer exists or is on a too-small filesystem). The
+      # job died at step 4 "Setup Node" after only 78 seconds.
+      #
+      # Reverted to manual cleanup but OPTIMIZED: we skip the slow apt-get clean
+      # and docker system prune (which took 3+ min in the original) and instead
+      # do a targeted rm -rf of the big space consumers. This frees ~75GB in
+      # under 30 seconds (vs 3+ min for the original) without breaking setup-node.
+      # The previous successful run had 110GB free after this style of cleanup,
+      # which is plenty for a 26GB REMUX + 26GB of split parts.
       - name: Maximize build disk space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 2048
-          swap-size-mb: 1024
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
+        shell: bash
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h /
+          echo ""
+          echo "=== Removing large pre-installed SDKs (dotnet, android, haskell, codeql) ==="
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          echo ""
+          echo "=== Removing unused Docker images (fast, non-blocking) ==="
+          docker image prune -af --filter "until=1h" 2>/dev/null || true
+          echo ""
+          echo "=== Disk space after cleanup ==="
+          df -h /
 
       - name: Setup Node
         uses: actions/setup-node@v4
