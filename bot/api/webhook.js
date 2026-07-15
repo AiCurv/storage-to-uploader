@@ -1,115 +1,105 @@
 // Telegram webhook entrypoint. Vercel invokes this on every incoming message.
 //
+// v8.2 architecture (per user spec 2026-07-15):
+//   - ONLY PixelDrain as upload service (file.kiwi + storage.to removed)
+//   - ONLY Gcore CDN as streaming layer (no /stream command — consolidated into post-upload buttons)
+//   - Single consolidated message on upload completion (no cascade of intermediate messages)
+//   - Inline buttons for: Open / Stream / Copy URL  (single file)
+//                         Copy M3U / Stream All / Download All  (multi-part)
+//   - /pixeldrain <url> and plain-URL messages both dispatch silently after a single
+//     "📥 Download link added to queue. Processing..." message
+//   - Stream button lazily provisions a Gcore CDN URL on click (answers callback
+//     query in <1s, then sends the stream URL as a new message)
+//   - Multi-part M3U uses PixelDrain raw URLs (not Gcore) because the single
+//     Gcore CDN resource can only point at one origin at a time — using Gcore
+//     URLs in the M3U would make all parts resolve to the last-provisioned part.
+//     This is the "GCore link generation fails → fall back to PixelDrain" case
+//     from the spec.
+//
 // Commands:
 //   /start              - Welcome message + main menu
-//   /upload <url>       - Upload a file URL (auto-asks which service)
-//   /raw <url>          - Same as /upload (kept for compatibility)
-//   /pixeldrain <url>   - Upload directly to pixeldrain (skip service picker)
-//   /filekiwi <url>     - Upload directly to file.kiwi (skip service picker)
-//   /stream <url>       - Instant CDN Stream via Gcore (no download, returns streamable URL)
-//   /service            - Show / change default service
-//   /status             - Current settings (shows default service)
+//   /pixeldrain <url>   - Upload to PixelDrain (auto-splits >10GB)
 //   /rename <name>      - Set custom filename for next upload
-//   /help               - Detailed help message
+//   /status             - Current settings
 //   /ping               - Bot latency check
+//   /help               - Detailed help message
 //   /about              - About the bot
 //
-// Any direct URL sent as text triggers the service picker (inline keyboard).
-// Forwarded files (documents, videos, audio, photos) will be detected and prompted.
-//
-// v8.0: storage.to removed. Services are now: pixeldrain (10GB/file, persistent) and
-// file.kiwi (999GiB/file, 90h retention, E2E encrypted, anonymous). Default = pixeldrain.
+// Any direct URL sent as text triggers upload to PixelDrain (no picker).
+// Forwarded files (documents, videos, audio, photos) are also uploaded.
 
 import { provisionStreamableUrl } from "./_gcore.js";
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
 
-const SERVICES = {
-  pixeldrain: { label: "🎬 PixelDrain", short: "pixeldrain", emoji: "🎬" },
-  filekiwi:   { label: "🥝 file.kiwi",  short: "file.kiwi",   emoji: "🥝" },
-};
-
 const WELCOME = [
   "📦 <b>StreamToBuffer Bot</b>",
   "",
-  "Send me any download link and I'll either:",
-  "  🚀 <b>Stream</b> it instantly via Gcore CDN (no download, no upload — instant streamable URL), or",
-  "  📦 <b>Upload</b> it to pixeldrain or file.kiwi (via GitHub Actions)",
+  "Send me any download link and I'll:",
+  "  📦 <b>Upload</b> it to PixelDrain (via GitHub Actions, auto-splits &gt;10GB)",
+  "  ▶️ Give you <b>Stream</b> + <b>Download</b> buttons (Gcore CDN stream on tap)",
   "",
   "📝 <b>Commands:</b>",
-  "/stream &lt;url&gt; — 🚀 Instant CDN stream (Gcore)",
-  "/upload &lt;url&gt; — Upload link (asks which service)",
-  "/pixeldrain &lt;url&gt; — Upload directly to pixeldrain",
-  "/filekiwi &lt;url&gt; — Upload directly to file.kiwi",
-  "/service — Show / change default service",
+  "/pixeldrain &lt;url&gt; — Upload to PixelDrain",
   "/rename &lt;name&gt; — Set custom filename",
   "/status — Current settings",
   "/ping — Latency check",
   "/help — Detailed help",
   "",
-  "💡 Works with ANY direct download link!",
+  "💡 Works with ANY direct download link (R2 / S3 / presigned / pixeldrain / etc.)",
   "📎 You can also forward files directly to me!",
 ].join("\n");
 
 const HELP_MSG = [
   "📖 <b>StreamToBuffer Help</b>",
   "",
-  "<b>Two ways to use a link:</b>",
+  "<b>How to use:</b>",
+  "• Send any direct download link as a message",
+  "• Or use <code>/pixeldrain &lt;url&gt;</code>",
+  "• I'll download it via GitHub Actions, upload to PixelDrain, and reply with one message containing:",
+  "  - Direct download link",
+  "  - Stream button (Gcore CDN — instant, no download)",
+  "  - Copy button",
   "",
-  "🚀 <b>Instant CDN Stream</b> (recommended for video):",
-  "• <b>/stream &lt;url&gt;</b> — returns an instant streamable URL via Gcore CDN",
-  "• No download/upload — Gcore edge pulls from origin on-the-fly",
-  "• Supports Range/seek (slice engine enabled)",
-  "• Streams 12GB+ MKV/MP4 in VLC, Stremio, TV players",
-  "• Works with pixeldrain, R2 presigned, any direct download link",
-  "",
-  "📦 <b>Upload services</b> (download + re-host via GitHub Actions):",
-  "• <b>pixeldrain</b> — persistent (60 days), max 10GB per file (auto-splits larger files)",
-  "• <b>file.kiwi</b> — anonymous, max 999 GiB, 90h retention, E2E encrypted",
+  "<b>File size handling:</b>",
+  "• &lt; 10 GB → single PixelDrain file",
+  "• ≥ 10 GB → auto-split into chunks, each uploaded separately, M3U playlist attached",
   "",
   "<b>Supported sources:</b>",
   "• Any direct download link (mp4, mkv, zip, etc.)",
   "• Pixeldrain links (auto-converted to API link for download)",
-  "• hubcloud / hub.latent.click extractor links",
   "• R2 / S3 / CloudFront presigned URLs (while still valid)",
   "• Any URL that serves file bytes directly",
   "",
   "<b>Forwarded files:</b>",
-  "• Forward a file to me and I'll ask if you want a download link",
-  "• Supports documents, videos, audio, photos",
+  "• Forward a file to me and I'll upload it to PixelDrain",
   "• Note: Telegram Bot API has a 20MB download limit for getFile",
   "",
   "<b>Commands:</b>",
-  "/stream <url> — 🚀 Instant CDN stream (Gcore)",
-  "/upload <url> — Upload a link (asks which service)",
-  "/pixeldrain <url> — Upload directly to pixeldrain (auto-splits >10GB)",
-  "/filekiwi <url> — Upload directly to file.kiwi (up to 999 GiB)",
-  "/service — Show / change default service",
-  "/raw <url> — Same as /upload",
+  "/pixeldrain <url> — Upload to PixelDrain (auto-splits >10GB)",
   "/rename <name> — Override filename for next upload",
   "/status — Current settings",
   "/ping — Check bot responsiveness",
   "/about — About this bot",
+  "/help — This help message",
 ].join("\n");
 
 const ABOUT_MSG = [
   "🤖 <b>StreamToBuffer Bot</b>",
   "",
-  "Two modes: instant CDN streaming via Gcore, or download+re-host via GitHub Actions.",
+  "Uploads any file URL to PixelDrain via GitHub Actions, with on-demand Gcore CDN streaming.",
   "",
   "🔧 <b>Tech Stack:</b>",
+  "• PixelDrain (file hosting, persistent, max 10GB/file, auto-splits larger)",
   "• Gcore CDN (instant streaming — slice engine, Range support, 200+ PoPs)",
-  "• GitHub Actions (download + upload for pixeldrain / file.kiwi)",
-  "• pixeldrain (file hosting, persistent, max 10GB/file on free tier, auto-splits larger)",
-  "• file.kiwi (file hosting, anonymous, max 999 GiB, 90h retention, E2E encrypted)",
+  "• GitHub Actions (download + upload + ffmpeg stream-copy split)",
   "• Vercel (bot webhook handler + Gcore API orchestrator)",
   "",
   "⚡ <b>Features:</b>",
-  "• 🚀 Instant CDN stream — no download, no upload, no storage used",
   "• Direct download passthrough — no conversion",
-  "• Choose service per upload (inline keyboard)",
-  "• Files up to 999 GiB supported (file.kiwi)",
   "• Auto-splitting for pixeldrain (files >10GB split with ffmpeg stream-copy)",
+  "• On-demand Gcore CDN stream (button-powered, no separate command)",
+  "• Multi-part M3U playlist for split files",
   "• Works with any direct download link",
   "• Forwarded Telegram files supported",
 ].join("\n");
@@ -117,96 +107,14 @@ const ABOUT_MSG = [
 // Per-user settings (in-memory, resets on redeploy)
 const userSettings = {};
 
-// Pending uploads: shortId → { url, filename, chatId, ts }
-// Used to bridge long URLs through Telegram's 64-byte callback_data limit.
-//
-// ⚠️ v7.6: This Map is in-memory and is WIPED on every Vercel cold start. To survive cold
-// starts, the URL is ALSO embedded in the picker message text (via createPendingUpload +
-// parseUrlFromPickerMessage). On callback, we first try the Map; if missing (cold start),
-// we fall back to parsing the URL from cb.message.text. This makes the inline button
-// reliable regardless of Vercel instance lifecycle.
-const pendingUploads = new Map();
-
 function getUserSettings(chatId) {
   const key = String(chatId);
   if (!userSettings[key]) {
     userSettings[key] = {
       nextFilename: null,
-      defaultService: "pixeldrain", // v8.0: changed from storageto to pixeldrain
     };
   }
   return userSettings[key];
-}
-
-function makePendingId() {
-  return [...crypto.getRandomValues(new Uint8Array(6))]
-    .map((b) => b.toString(36).padStart(2, "0"))
-    .join("");
-}
-
-// Create a pending upload entry AND return the message text that embeds the URL.
-// The picker message includes the URL in a parseable format so we can recover it
-// on callback even if the in-memory Map was wiped by a Vercel cold start.
-// Format: "🔗 URL received\n🌐 <code>{url}</code>\n📦 <code>{filename}</code>\n\nPick an action:"
-function createPendingUpload(url, filename, chatId) {
-  // Cleanup old pendings (>10 min)
-  const now = Date.now();
-  for (const [id, p] of pendingUploads) {
-    if (now - p.ts > 10 * 60 * 1000) pendingUploads.delete(id);
-  }
-  const id = makePendingId();
-  pendingUploads.set(id, { url, filename, chatId, ts: now });
-  return id;
-}
-
-function takePendingUpload(id) {
-  const p = pendingUploads.get(id);
-  if (!p) return null;
-  pendingUploads.delete(id);
-  return p;
-}
-
-// v7.6: Recover URL from picker message text when in-memory Map was wiped (Vercel cold start).
-// Looks for any URL in the message text — first tries <code>...</code> blocks, then plain URL regex.
-// Returns the URL string or null if not found.
-function parseUrlFromPickerMessage(messageText) {
-  if (!messageText) return null;
-  // First try: extract from <code>URL</code> blocks
-  const codeMatch = messageText.match(/<code>(https?:\/\/[^<]+)<\/code>/i);
-  if (codeMatch) return codeMatch[1];
-  // Second try: plain URL regex (in case the message format changed)
-  const urlMatch = messageText.match(/https?:\/\/\S+/i);
-  return urlMatch ? urlMatch[0] : null;
-}
-
-// v7.6: Recover filename from picker message text. Looks for the second <code> block.
-// Note: filename is HTML-escaped when written to the picker message, so we unescape it here.
-function parseFilenameFromPickerMessage(messageText) {
-  if (!messageText) return null;
-  const codeMatches = messageText.matchAll(/<code>([^<]+)<\/code>/gi);
-  const matches = [...codeMatches];
-  if (matches.length >= 2) return unescapeHtml(matches[1][1]);
-  return null;
-}
-
-// v7.6: Reverse of escapeHtml — converts HTML entities back to literal chars.
-// Used when recovering filenames from picker message text.
-function unescapeHtml(s) {
-  return String(s).replace(/&(amp|lt|gt|quot|#39);/g, (m, e) => ({
-    "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'",
-  }[m]));
-}
-
-// v7.6: Look up a pending upload by id; if missing (cold start), recover URL from the picker
-// message text. Returns { url, filename, chatId, recoveredFromMessage } or null.
-function lookupPendingUpload(pendingId, pickerMessageText, chatId) {
-  const p = takePendingUpload(pendingId);
-  if (p) return { ...p, recoveredFromMessage: false };
-  // Fallback: parse URL from picker message text
-  const url = parseUrlFromPickerMessage(pickerMessageText);
-  if (!url) return null;
-  const filename = parseFilenameFromPickerMessage(pickerMessageText) || filenameFromUrl(url);
-  return { url, filename, chatId, ts: Date.now(), recoveredFromMessage: true };
 }
 
 async function sendMessage(chatId, text, extra = {}) {
@@ -223,13 +131,14 @@ async function sendMessage(chatId, text, extra = {}) {
   });
 }
 
-async function answerCallbackQuery(callbackQueryId, text = "") {
+async function answerCallbackQuery(callbackQueryId, text = "", opts = {}) {
   await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       callback_query_id: callbackQueryId,
       text,
+      ...opts,
     }),
   });
 }
@@ -238,8 +147,7 @@ function mainMenu() {
   return {
     reply_markup: {
       keyboard: [
-        [{ text: "🚀 Stream" }, { text: "🔗 Upload link" }, { text: "🔄 Service" }],
-        [{ text: "/status" }, { text: "/help" }, { text: "/ping" }],
+        [{ text: "🔗 Upload link" }, { text: "/status" }, { text: "/help" }, { text: "/ping" }],
       ],
       resize_keyboard: true,
       is_persistent: true,
@@ -278,11 +186,7 @@ function filenameFromUrl(url) {
   }
 }
 
-function isValidService(s) {
-  return s === "pixeldrain" || s === "filekiwi";
-}
-
-async function triggerUpload(sourceUrl, originalName, chatId, service) {
+async function triggerUpload(sourceUrl, originalName, chatId) {
   const repo = process.env.GITHUB_REPO || "AiCurv/storage-to-uploader";
   const [owner, name] = repo.split("/");
   const settings = getUserSettings(chatId);
@@ -290,15 +194,13 @@ async function triggerUpload(sourceUrl, originalName, chatId, service) {
   const finalName = settings.nextFilename || originalName;
   settings.nextFilename = null;
 
-  const finalService = isValidService(service) ? service : settings.defaultService || "pixeldrain";
-
   const payload = {
     event_type: "telegram-upload",
     client_payload: {
       source_url: sourceUrl,
       filename: finalName,
       chat_id: String(chatId),
-      service: finalService,
+      service: "pixeldrain", // v8.2: only service
     },
   };
 
@@ -318,131 +220,14 @@ async function triggerUpload(sourceUrl, originalName, chatId, service) {
     const text = await res.text();
     throw new Error(`dispatch ${res.status}: ${text.slice(0, 200)}`);
   }
-  return { finalService, finalName };
+  return { finalName };
 }
 
-// Lightweight logger for visibility in Vercel logs
 function logDispatch(stage, data) {
   try {
     const cp = data.client_payload || {};
     console.log(`[webhook:${stage}] chat_id=${cp.chat_id} service=${cp.service} filename=${cp.filename} url_len=${(cp.source_url || "").length}`);
   } catch {}
-}
-
-// ─── Instant CDN Stream (Gcore) ──────────────────────────────────────────────
-
-async function handleStreamRequest(chatId, sourceUrl, opts = {}) {
-  const { skipInitialMessage = false } = opts;
-  if (!looksLikeUrl(sourceUrl)) {
-    await sendMessage(chatId, "❌ Provide a valid URL.\nExample: <code>/stream https://pixeldrain.com/api/file/abc</code>", mainMenu());
-    return;
-  }
-  // Normalize PixelDrain /u/<id> and /d/<id> to /api/file/<id> so the origin serves raw bytes.
-  // NOTE: /l/<id> (file LIST) is NOT normalized — _gcore.js analyzeSourceUrl() will catch it
-  // and return kind="pixeldrain_list" with a friendly explanation.
-  const normalized = normalizeSourceUrl(sourceUrl) || sourceUrl;
-  if (!skipInitialMessage) {
-    await sendMessage(chatId,
-      "🚀 <b>Instant CDN Stream</b>\n" +
-      "⏳ Provisioning Gcore edge route... (2-5s)",
-      mainMenu());
-  }
-  try {
-    const r = await provisionStreamableUrl(normalized);
-
-    // ── Branch on result kind ──
-    if (r.kind === "self_loop") {
-      // User fed the bot's OWN CDN URL back to /stream → would create infinite origin loop
-      await sendMessage(chatId,
-        "⚠️ <b>That URL is already a Gcore CDN stream URL</b>\n\n" +
-        `The link you sent lives on <code>${r.cname}</code> — that's <b>my own CDN edge</b>. ` +
-        "Feeding it back through /stream would make the CDN fetch from itself in an infinite loop.\n\n" +
-        "<b>Just open the URL directly</b> in VLC / Stremio / your TV — it's already accelerated.\n\n" +
-        "If the URL doesn't work, the most likely cause is:\n" +
-        "• A newer /stream call repointed the CDN at a different origin (each /stream invalidates the previous one)\n" +
-        "• The original source URL has expired (presigned URLs die after ~8 hours)\n\n" +
-        "💡 <b>Fix:</b> send the ORIGINAL source link (pixeldrain / direct download) to /stream again.",
-        mainMenu());
-      return;
-    }
-
-    if (r.kind === "expired") {
-      // Presigned URL (R2 / S3 / Azure / GCS) already expired
-      await sendMessage(chatId,
-        "⏰ <b>Source URL has expired</b>\n\n" +
-        `The link you sent is a presigned URL (R2/S3/Azure/GCS) that expired at <code>${r.expiredAt}</code>.\n\n` +
-        "Gcore CDN can't fetch a fresh copy from an expired origin URL — the origin returns 403 Forbidden.\n\n" +
-        "<b>Fix:</b> get a fresh presigned URL from wherever you got this one, then send it to /stream again.\n\n" +
-        "💡 Tip: presigned URLs typically live 1-8 hours. /stream them as soon as you get them.",
-        mainMenu());
-      return;
-    }
-
-    if (r.kind === "pixeldrain_list") {
-      // Pixeldrain /l/<id> returns HTML, not raw bytes
-      await sendMessage(chatId,
-        "📋 <b>That's a Pixeldrain file list, not a single file</b>\n\n" +
-        `Pixeldrain list <code>${r.listId}</code> is an HTML gallery page — Gcore CDN can't stream HTML as video.\n\n` +
-        "<b>How to stream from a list:</b>\n" +
-        `1. Open <a href="https://pixeldrain.com/l/${r.listId}">https://pixeldrain.com/l/${r.listId}</a> in your browser\n` +
-        "2. Click the file you want\n" +
-        "3. Copy the URL from the address bar (it'll look like <code>pixeldrain.com/u/XXXXXX</code>)\n" +
-        "4. Send that URL to /stream — I'll give you back a streamable CDN link",
-        mainMenu());
-      return;
-    }
-
-    // ── Default: kind === "stream" — normal Gcore CDN stream ──
-    const lines = [
-      "🚀 <b>Stream ready!</b>",
-      "",
-      `🔗 <a href="${r.streamUrl}">${r.streamUrl}</a>`,
-      "",
-      `📡 Origin: <code>${r.originHost}</code>`,
-      `🌐 Gcore edge: <code>${r.cname}</code>`,
-      `🔒 SSL: Let's Encrypt (auto-renewed)`,
-      `🆔 Resource: <code>${r.resourceId}</code> · cache purged`,
-      r.groupCreated ? `✨ Origin group created (<code>${r.groupId}</code>)` : `♻️ Reused origin group (<code>${r.groupId}</code>)`,
-    ];
-    if (r.ruleApplied) {
-      if (r.ruleCreated) {
-        lines.push(`✨ Stream rule created (v7.6) — strips Content-Disposition, forces Accept-Ranges + Cache-Control`);
-      } else if (r.ruleUpgraded) {
-        lines.push(`⬆️ Stream rule upgraded to v7.6 — strips Content-Disposition, forces Accept-Ranges + Cache-Control`);
-      } else {
-        lines.push(`♻️ Stream rule active (v7.6) — strips Content-Disposition, forces Accept-Ranges + Cache-Control`);
-      }
-    }
-    if (r.presignedExpiresAt) {
-      // Warn the user the source URL is a presigned URL that will expire
-      const expiryDate = new Date(r.presignedExpiresAt);
-      const hoursLeft = Math.max(0, (expiryDate.getTime() - Date.now()) / 3600000);
-      lines.push("");
-      lines.push(`⏰ <b>Source URL expires in ~${hoursLeft.toFixed(1)} hours</b> (at ${expiryDate.toISOString()})`);
-      lines.push("After that, Gcore CDN can't fetch fresh bytes — re-run /stream with a new presigned URL.");
-    }
-    lines.push("");
-    lines.push("<b>How to use:</b>");
-    lines.push("• Paste the URL into VLC / Stremio / your TV's media player");
-    lines.push("• <b>Pause / resume / seek all work</b> — Content-Disposition forced to 'inline'");
-    lines.push("• <b>Edge cache forced (4 days)</b> — defeats origin's no-store, second play = instant");
-    lines.push("• Gcore pulls from origin on-the-fly — no download, no upload");
-    lines.push("• First byte may take ~2-5s (cache warm-up), then full speed");
-    lines.push("");
-    lines.push("⚠️ <b>Important:</b> each new /stream call repoints this CDN resource at the latest origin.");
-    lines.push("This URL works until you /stream a different link, or until the source URL expires.");
-    await sendMessage(chatId, lines.join("\n"), mainMenu());
-  } catch (err) {
-    console.error("[stream] error:", err.message, err.body || "");
-    const msg = err.message || "unknown error";
-    let hint = "";
-    if (msg.includes("GCORE_")) {
-      hint = "\n\n💡 Tip: ask the bot admin to set GCORE_API_TOKEN, GCORE_CDN_RESOURCE_ID, GCORE_CDN_CNAME in Vercel env.";
-    } else if (msg.includes("CDN service is stopped") || msg.includes("permission")) {
-      hint = "\n\n💡 Tip: Gcore CDN service must be activated in the portal first (https://portal.gcore.com/cdn/resources/list).";
-    }
-    await sendMessage(chatId, `❌ <b>Stream failed:</b>\n<code>${escapeHtml(msg).slice(0, 400)}</code>${hint}`, mainMenu());
-  }
 }
 
 // Minimal HTML-escape for user-supplied strings shown in Telegram HTML messages.
@@ -464,7 +249,6 @@ function stripBotSuffix(text) {
 // ─── Extract file info from a Telegram message ───────────────
 
 function extractFileInfo(message) {
-  // Priority: document > video > audio > animation > voice > photo
   if (message.document) {
     return {
       file_id: message.document.file_id,
@@ -511,7 +295,6 @@ function extractFileInfo(message) {
     };
   }
   if (message.photo) {
-    // photo is an array of sizes, pick the largest
     const photos = message.photo;
     const largest = photos[photos.length - 1];
     return {
@@ -527,45 +310,83 @@ function extractFileInfo(message) {
 
 function formatFileSize(bytes) {
   if (!bytes) return "?";
-  const u = ["B", "KB", "MB", "GB"];
+  const u = ["B", "KB", "MB", "GB", "TB"];
   let i = 0;
   while (bytes >= 1024 && i < u.length - 1) { bytes /= 1024; i++; }
   return `${bytes.toFixed(i > 0 ? 1 : 0)} ${u[i]}`;
 }
 
-// ─── Service picker keyboard ───────────────────────────────────
-// Returns inline keyboard with all options. Uses pending-id so callback_data stays short.
-function servicePickerKeyboard(pendingId, currentService) {
-  const pixeldrainLabel = currentService === "pixeldrain" ? "✅ 🎬 PixelDrain" : "🎬 PixelDrain";
-  const filekiwiLabel   = currentService === "filekiwi"   ? "✅ 🥝 file.kiwi"  : "🥝 file.kiwi";
-  return {
-    inline_keyboard: [
-      [
-        { text: "🚀 Stream (instant CDN)", callback_data: `pick_stream:${pendingId}` },
-      ],
-      [
-        { text: pixeldrainLabel, callback_data: `pick_svc:${pendingId}:pixeldrain` },
-        { text: filekiwiLabel,   callback_data: `pick_svc:${pendingId}:filekiwi` },
-      ],
-      [
-        { text: "❌ Cancel", callback_data: `cancel_pending:${pendingId}` },
-      ],
-    ],
-  };
-}
+// ─── On-demand Gcore stream provisioning (button-powered) ────
+//
+// When the user taps "▶️ Stream" or "▶️ Stream Part N", we:
+//   1. answerCallbackQuery IMMEDIATELY (clears the button spinner in <1s)
+//   2. send a "⏳ Provisioning Gcore stream..." message so user has feedback
+//   3. call provisionStreamableUrl(pixeldrain_raw_url) in the background
+//   4. on success → send a new message with the Gcore stream URL
+//   5. on failure → send a new message with the PixelDrain raw URL as fallback
+//
+// NOTE: Gcore's single-CDN-resource architecture means each /stream call repoints
+// the CDN at the latest origin. So if user streams Part 1 then Part 2, the Part 1
+// URL will now serve Part 2's content. We warn the user about this in the message.
 
-// Picker for /service command (no pending upload, just setting default)
-function defaultServicePickerKeyboard(currentService) {
-  const pixeldrainLabel = currentService === "pixeldrain" ? "✅ 🎬 PixelDrain" : "🎬 PixelDrain";
-  const filekiwiLabel   = currentService === "filekiwi"   ? "✅ 🥝 file.kiwi"  : "🥝 file.kiwi";
-  return {
-    inline_keyboard: [
-      [
-        { text: pixeldrainLabel, callback_data: `set_def:pixeldrain` },
-        { text: filekiwiLabel,   callback_data: `set_def:filekiwi` },
-      ],
-    ],
-  };
+async function provisionAndSendStreamUrl(chatId, pixeldrainRawUrl, label, callbackQueryId) {
+  // Already answered the callback query before calling this — no need to answer again.
+  try {
+    const r = await provisionStreamableUrl(pixeldrainRawUrl);
+    if (r.kind === "stream") {
+      const lines = [
+        `▶️ <b>Gcore Stream Ready</b>${label ? ` — ${escapeHtml(label)}` : ""}`,
+        "",
+        `🔗 <a href="${r.streamUrl}">${r.streamUrl}</a>`,
+        "",
+        "📱 <b>How to use:</b>",
+        "• Paste into VLC / Stremio / TV media player",
+        "• Pause / resume / seek all work",
+        "• First byte may take ~2-5s (cache warm-up)",
+        "",
+        "⚠️ <b>Important:</b> each new Stream tap repoints the CDN at the latest part.",
+        "If you stream multiple parts, only the LAST one will work at any given time.",
+      ];
+      if (r.presignedExpiresAt) {
+        const expiryDate = new Date(r.presignedExpiresAt);
+        const hoursLeft = Math.max(0, (expiryDate.getTime() - Date.now()) / 3600000);
+        lines.push("");
+        lines.push(`⏰ Source URL expires in ~${hoursLeft.toFixed(1)} hours`);
+      }
+      await sendMessage(chatId, lines.join("\n"), mainMenu());
+      return;
+    }
+    if (r.kind === "self_loop") {
+      await sendMessage(chatId,
+        `⚠️ <b>Already a Gcore CDN URL</b>\n\nThis link is already on my CDN edge. Just open it directly.`,
+        mainMenu());
+      return;
+    }
+    if (r.kind === "expired") {
+      await sendMessage(chatId,
+        `⏰ <b>Source URL expired</b>\n\nThe PixelDrain source has expired (at ${r.expiredAt}).\n\nFallback direct link:\n${pixeldrainRawUrl}`,
+        mainMenu());
+      return;
+    }
+    if (r.kind === "pixeldrain_list") {
+      await sendMessage(chatId,
+        `📋 <b>PixelDrain list — not a single file</b>\n\nOpen the list, click a file, copy its /u/<id> URL and try again.\n\nFallback:\n${pixeldrainRawUrl}`,
+        mainMenu());
+      return;
+    }
+    // Unknown kind — fall back to direct URL
+    await sendMessage(chatId,
+      `⚠️ Could not provision Gcore stream. Direct link:\n${pixeldrainRawUrl}`,
+      mainMenu());
+  } catch (err) {
+    console.error("[stream] error:", err.message, err.body || "");
+    // Per spec: If GCore link generation fails: Show PixelDrain link as fallback
+    await sendMessage(chatId,
+      `⚠️ <b>Gcore stream failed</b> — showing PixelDrain direct link as fallback:\n\n` +
+      `<code>${escapeHtml(pixeldrainRawUrl)}</code>\n\n` +
+      `<code>${escapeHtml(err.message || "unknown error").slice(0, 200)}</code>`,
+      mainMenu());
+  }
 }
 
 export default async function handler(req, res) {
@@ -585,203 +406,178 @@ export default async function handler(req, res) {
     const data = cb.data || "";
     const chatId = String(cb.message?.chat?.id || cb.from?.id || "");
 
-    // Stream button picked — instant Gcore CDN stream, no download
-    if (data.startsWith("pick_stream:")) {
-      const [, pendingId] = data.split(":");
-      // v7.6: use lookupPendingUpload which falls back to parsing the URL from the picker
-      // message text if the in-memory Map was wiped (Vercel cold start).
-      const pickerMessageText = cb.message?.text || cb.message?.caption || "";
-      const pending = lookupPendingUpload(pendingId, pickerMessageText, chatId);
-      if (!pending) {
-        await answerCallbackQuery(cb.id, "⚠️ Session expired. Please send the URL again.");
-        return res.status(200).json({ ok: true });
-      }
-      // IMPORTANT: Telegram callback queries must be answered quickly (the user sees a spinner
-      // on the button). We answer the callback immediately, send a "provisioning" message so
-      // the user has visual feedback, then return HTTP 200 to Telegram right away.
-      // handleStreamRequest runs in the background — Vercel keeps the function alive as long as
-      // there are pending promises (maxDuration=60s). Final stream URL is delivered as a
-      // separate Telegram message when Gcore provisioning completes (~2-3s).
-      await answerCallbackQuery(cb.id, "🚀 Provisioning Gcore stream...");
-      await sendMessage(
-        chatId,
-        "🚀 <b>Instant CDN Stream</b>\n" +
-        "⏳ Provisioning Gcore edge route... (5-10s)",
-        mainMenu()
-      );
+    // ── Button: Copy direct URL (single file) ──
+    // Format: copy:<pixeldrain_id>
+    if (data.startsWith("copy:")) {
+      const pixeldrainId = data.slice(5);
+      const directUrl = `https://pixeldrain.com/u/${pixeldrainId}`;
+      const rawUrl = `https://pixeldrain.com/api/file/${pixeldrainId}`;
+      await answerCallbackQuery(cb.id, "📋 URL ready below 👇");
+      await sendMessage(chatId,
+        `📋 <b>Copy these URLs:</b>\n\n` +
+        `🌐 <b>View page:</b>\n<code>${directUrl}</code>\n\n` +
+        `⬇️ <b>Direct download:</b>\n<code>${rawUrl}</code>\n\n` +
+        `<i>Long-press either URL → Copy</i>`,
+        mainMenu());
+      return res.status(200).json({ ok: true });
+    }
+
+    // ── Button: Open in browser (single file) ──
+    // Format: open:<pixeldrain_id>
+    if (data.startsWith("open:")) {
+      const pixeldrainId = data.slice(5);
+      const directUrl = `https://pixeldrain.com/u/${pixeldrainId}`;
+      await answerCallbackQuery(cb.id, "📂 Opening...");
+      await sendMessage(chatId,
+        `📂 <b>Open in browser:</b>\n\n<a href="${directUrl}">${directUrl}</a>`,
+        mainMenu());
+      return res.status(200).json({ ok: true });
+    }
+
+    // ── Button: Stream single file via Gcore ──
+    // Format: stream:<pixeldrain_id>
+    if (data.startsWith("stream:")) {
+      const pixeldrainId = data.slice(7);
+      const rawUrl = `https://pixeldrain.com/api/file/${pixeldrainId}`;
+      // CRITICAL: answer callback query IMMEDIATELY to clear the button spinner
+      await answerCallbackQuery(cb.id, "⏳ Provisioning Gcore stream...");
+      // Send a "provisioning" message so the user has visual feedback
+      await sendMessage(chatId,
+        "▶️ <b>Gcore Stream</b>\n⏳ Provisioning CDN edge route... (2-5s)",
+        mainMenu());
       // Fire-and-forget: do NOT await — return HTTP 200 to Telegram immediately.
-      handleStreamRequest(chatId, pending.url, { skipInitialMessage: true })
+      // Vercel keeps the function alive (maxDuration=60s) while the background
+      // promise resolves. Final stream URL is delivered as a new message.
+      provisionAndSendStreamUrl(chatId, rawUrl, "", cb.id)
         .catch(err => {
-          console.error("[stream callback bg] error:", err.message, err.body || "");
-          sendMessage(chatId, `❌ <b>Stream failed:</b>\n<code>${(err.message || "unknown error").slice(0, 400)}</code>`, mainMenu())
+          console.error("[stream callback bg] error:", err.message);
+          sendMessage(chatId, `❌ <b>Stream failed:</b>\n<code>${escapeHtml(err.message || "").slice(0, 200)}</code>`, mainMenu())
             .catch(() => {});
         });
       return res.status(200).json({ ok: true });
     }
 
-    // Service picked for an upload (pending id present)
-    if (data.startsWith("pick_svc:")) {
-      const [, pendingId, service] = data.split(":");
-      // v7.6: use lookupPendingUpload which falls back to parsing the URL from the picker
-      // message text if the in-memory Map was wiped (Vercel cold start).
-      const pickerMessageText = cb.message?.text || cb.message?.caption || "";
-      const pending = lookupPendingUpload(pendingId, pickerMessageText, chatId);
-      if (!pending) {
-        await answerCallbackQuery(cb.id, "⚠️ Session expired. Please send the URL again.");
-        return res.status(200).json({ ok: true });
-      }
-      if (!isValidService(service)) {
-        await answerCallbackQuery(cb.id, "Invalid service.");
-        return res.status(200).json({ ok: true });
-      }
-      const svcInfo = SERVICES[service];
-      // Same non-blocking pattern as pick_stream: answer callback + send "queued" message,
-      // then return HTTP 200 immediately. triggerUpload runs in the background.
-      await answerCallbackQuery(cb.id, `Uploading to ${svcInfo.short}...`);
-      await sendMessage(
-        chatId,
-        `⏬ <b>Uploading to ${svcInfo.label}</b>\n` +
-        `🔄 Queuing dispatch to GitHub Actions...\n` +
-        `⏳ I'll message you when done!`,
-        mainMenu()
-      );
-      // Fire-and-forget: do NOT await — return HTTP 200 to Telegram immediately.
-      (async () => {
-        try {
-          const { finalName } = await triggerUpload(pending.url, pending.filename, chatId, service);
-          await sendMessage(
-            chatId,
-            `📦 <b>Upload dispatched</b>\n` +
-            `<code>${finalName}</code>\n` +
-            `🔄 Downloading → Uploading...\n` +
-            `⏳ I'll message you when done!`,
-            mainMenu()
-          );
-        } catch (err) {
-          await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
-        }
-      })();
-      return res.status(200).json({ ok: true });
-    }
-
-    // Cancel pending upload
-    if (data.startsWith("cancel_pending:")) {
-      const [, pendingId] = data.split(":");
-      pendingUploads.delete(pendingId);
-      await answerCallbackQuery(cb.id, "Cancelled");
-      await sendMessage(chatId, "❌ Upload cancelled.", mainMenu());
-      return res.status(200).json({ ok: true });
-    }
-
-    // Set default service (from /service command)
-    if (data.startsWith("set_def:")) {
-      const [, service] = data.split(":");
-      if (!isValidService(service)) {
-        await answerCallbackQuery(cb.id, "Invalid service.");
-        return res.status(200).json({ ok: true });
-      }
-      const settings = getUserSettings(chatId);
-      settings.defaultService = service;
-      const svcInfo = SERVICES[service];
-      await answerCallbackQuery(cb.id, `Default service: ${svcInfo.short}`);
-      await sendMessage(
-        chatId,
-        `✅ <b>Default service set to ${svcInfo.label}</b>\n\n` +
-        `URLs you send will now upload to ${svcInfo.short} by default.\n` +
-        `You can still override per-upload via the picker.`,
-        mainMenu()
-      );
-      return res.status(200).json({ ok: true });
-    }
-
-    // Original forwarded-file confirmation flow
-    if (data.startsWith("upload_file:")) {
-      // User confirmed they want to upload a forwarded file
-      // Format: upload_file:<service>:<encoded_tgfile_url>:<encoded_filename>
-      // OR legacy: upload_file:<encoded_tgfile_url>:<encoded_filename>
+    // ── Button: Stream a specific part (multi-part) via Gcore ──
+    // Format: stream_part:<partIndex>:<pixeldrain_id>
+    if (data.startsWith("stream_part:")) {
       const parts = data.split(":");
-      let service, fileSourceUrl, fileName;
-      if (parts.length >= 4 && (parts[1] === "pixeldrain" || parts[1] === "filekiwi")) {
-        service = parts[1];
-        fileSourceUrl = decodeURIComponent(parts[2]);
-        fileName = decodeURIComponent(parts.slice(3).join(":"));
+      const partIndex = parts[1];
+      const pixeldrainId = parts[2];
+      const rawUrl = `https://pixeldrain.com/api/file/${pixeldrainId}`;
+      await answerCallbackQuery(cb.id, `⏳ Provisioning Part ${partIndex}...`);
+      await sendMessage(chatId,
+        `▶️ <b>Gcore Stream — Part ${partIndex}</b>\n⏳ Provisioning CDN edge route... (2-5s)`,
+        mainMenu());
+      provisionAndSendStreamUrl(chatId, rawUrl, `Part ${partIndex}`, cb.id)
+        .catch(err => {
+          console.error("[stream_part callback bg] error:", err.message);
+          sendMessage(chatId, `❌ <b>Stream failed:</b>\n<code>${escapeHtml(err.message || "").slice(0, 200)}</code>`, mainMenu())
+            .catch(() => {});
+        });
+      return res.status(200).json({ ok: true });
+    }
+
+    // ── Button: Download All (multi-part) ──
+    // Format: download_all:<num_parts>
+    // We recover the pixeldrain IDs from the original upload-complete message text
+    // (not from callback_data, which would overflow the 64-byte limit for >5 parts).
+    if (data.startsWith("download_all:")) {
+      const numParts = parseInt(data.split(":")[1], 10);
+      const msgText = cb.message?.text || cb.message?.caption || "";
+      const ids = extractPixeldrainIdsFromMessage(msgText, numParts);
+      if (ids.length === 0) {
+        await answerCallbackQuery(cb.id, "⚠️ Could not recover parts");
+        await sendMessage(chatId,
+          `⚠️ Could not recover part URLs. Please scroll up to the original upload-complete message for the links.`,
+          mainMenu());
+        return res.status(200).json({ ok: true });
+      }
+      await answerCallbackQuery(cb.id, `📋 ${ids.length} URLs ready below 👇`);
+      const lines = [`📋 <b>Download All — ${ids.length} parts</b>`, ``];
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        lines.push(`<b>Part ${i + 1}/${ids.length}:</b>`);
+        lines.push(`🌐 <code>https://pixeldrain.com/u/${id}</code>`);
+        lines.push(`⬇️ <code>https://pixeldrain.com/api/file/${id}</code>`);
+        lines.push(``);
+      }
+      lines.push(`<i>Long-press any URL → Copy</i>`);
+      await sendMessage(chatId, lines.join("\n"), mainMenu());
+      return res.status(200).json({ ok: true });
+    }
+
+    // ── Button: Stream All (multi-part) ──
+    // Format: stream_all:<num_parts>
+    // Sends a new message with per-part stream buttons (because Gcore can only
+    // point at one origin at a time, we can't stream all parts concurrently —
+    // user taps each part they want to stream).
+    if (data.startsWith("stream_all:")) {
+      const numParts = parseInt(data.split(":")[1], 10);
+      await answerCallbackQuery(cb.id, "▶️ Pick a part to stream");
+      // We need the part IDs to build per-part buttons. They're not in callback_data
+      // (too long for 64-byte limit). We recover them from the original message text.
+      const msgText = cb.message?.text || cb.message?.caption || "";
+      const ids = extractPixeldrainIdsFromMessage(msgText, numParts);
+      if (ids.length === 0) {
+        await sendMessage(chatId,
+          `⚠️ <b>Could not recover part IDs</b>\n\nThe original message with parts list is needed to stream. Please scroll up and tap a part's individual link.`,
+          mainMenu());
+        return res.status(200).json({ ok: true });
+      }
+      // Build inline keyboard with one button per part (4 per row)
+      const rows = [];
+      let row = [];
+      for (let i = 0; i < ids.length; i++) {
+        row.push({ text: `▶️ Part ${i + 1}`, callback_data: `stream_part:${i + 1}:${ids[i]}` });
+        if (row.length === 3 || i === ids.length - 1) {
+          rows.push(row);
+          row = [];
+        }
+      }
+      await sendMessage(chatId,
+        `▶️ <b>Stream All — pick a part</b>\n\n` +
+        `Gcore CDN can only stream one part at a time (single-resource architecture).\n` +
+        `Tap a part button below to provision a stream URL for that part.\n\n` +
+        `⚠️ Each tap repoints the CDN — previous stream URLs will serve the new part's content.`,
+        { reply_markup: { inline_keyboard: rows } });
+      return res.status(200).json({ ok: true });
+    }
+
+    // ── Button: Copy M3U (multi-part) ──
+    // Format: copy_m3u:<num_parts>
+    // Recover part IDs from the original message and rebuild the M3U inline.
+    if (data.startsWith("copy_m3u:")) {
+      const numParts = parseInt(data.split(":")[1], 10);
+      const msgText = cb.message?.text || cb.message?.caption || "";
+      const ids = extractPixeldrainIdsFromMessage(msgText, numParts);
+      if (ids.length === 0) {
+        await answerCallbackQuery(cb.id, "⚠️ Could not recover parts");
+        await sendMessage(chatId,
+          `⚠️ Could not rebuild M3U. The .m3u file was attached to the original upload-complete message — please download it from there.`,
+          mainMenu());
+        return res.status(200).json({ ok: true });
+      }
+      await answerCallbackQuery(cb.id, "📋 M3U ready below 👇");
+      const m3u = buildM3U(ids, msgText);
+      // Telegram messages cap at 4096 chars. For many parts, the M3U may not fit.
+      // Send as a code block if short, otherwise send just the playlist URLs.
+      if (m3u.length < 3500) {
+        await sendMessage(chatId,
+          `📋 <b>M3U Playlist (${ids.length} parts):</b>\n\n<code>${escapeHtml(m3u)}</code>\n\n<i>Long-press → Copy. Paste into a .m3u file, or send to VLC.</i>`,
+          mainMenu());
       } else {
-        // Legacy: no service in callback, use default
-        service = getUserSettings(chatId).defaultService || "pixeldrain";
-        fileSourceUrl = decodeURIComponent(parts[1]);
-        fileName = decodeURIComponent(parts.slice(2).join(":"));
-      }
-
-      await answerCallbackQuery(cb.id, `Uploading to ${SERVICES[service].short}...`);
-      await sendMessage(
-        chatId,
-        `⏬ <b>Uploading to ${SERVICES[service].label}</b>\n` +
-        `🔄 Queuing dispatch to GitHub Actions...\n` +
-        `⏳ I'll message you when done!`,
-        mainMenu()
-      );
-      // Fire-and-forget: do NOT await — return HTTP 200 to Telegram immediately.
-      (async () => {
-        try {
-          const { finalName } = await triggerUpload(fileSourceUrl, fileName, chatId, service);
-          await sendMessage(
-            chatId,
-            `📦 <b>Upload dispatched</b>\n` +
-            `<code>${finalName}</code>\n` +
-            `🔄 Downloading → Uploading...\n` +
-            `⏳ I'll message you when done!`,
-            mainMenu()
-          );
-        } catch (err) {
-          await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
+        // Too long — send URLs only
+        const lines = [`📋 <b>M3U URLs (M3U too long for chat — use attached .m3u file):</b>`, ``];
+        for (let i = 0; i < ids.length; i++) {
+          lines.push(`Part ${i + 1}: <code>https://pixeldrain.com/api/file/${ids[i]}</code>`);
         }
-      })();
-      return res.status(200).json({ ok: true });
-    }
-
-    // Forwarded-file: pick service first
-    if (data.startsWith("pick_svc_file:")) {
-      // Format: pick_svc_file:<service>:<encoded_tgfile_url>:<encoded_filename>
-      const parts = data.split(":");
-      const service = parts[1];
-      const fileSourceUrl = decodeURIComponent(parts[2]);
-      const fileName = decodeURIComponent(parts.slice(3).join(":"));
-      if (!isValidService(service)) {
-        await answerCallbackQuery(cb.id, "Invalid service.");
-        return res.status(200).json({ ok: true });
+        await sendMessage(chatId, lines.join("\n"), mainMenu());
       }
-      await answerCallbackQuery(cb.id, `Uploading to ${SERVICES[service].short}...`);
-      await sendMessage(
-        chatId,
-        `⏬ <b>Uploading to ${SERVICES[service].label}</b>\n` +
-        `🔄 Queuing dispatch to GitHub Actions...\n` +
-        `⏳ I'll message you when done!`,
-        mainMenu()
-      );
-      // Fire-and-forget: do NOT await — return HTTP 200 to Telegram immediately.
-      (async () => {
-        try {
-          const { finalName } = await triggerUpload(fileSourceUrl, fileName, chatId, service);
-          await sendMessage(
-            chatId,
-            `📦 <b>Upload dispatched</b>\n` +
-            `<code>${finalName}</code>\n` +
-            `⏳ I'll message you when done!`,
-            mainMenu()
-          );
-        } catch (err) {
-          await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
-        }
-      })();
       return res.status(200).json({ ok: true });
     }
 
-    if (data === "cancel_upload") {
-      await answerCallbackQuery(cb.id, "Cancelled");
-      await sendMessage(chatId, "❌ Upload cancelled.", mainMenu());
-      return res.status(200).json({ ok: true });
-    }
-
+    // Unknown callback
+    await answerCallbackQuery(cb.id, "");
     return res.status(200).json({ ok: true });
   }
 
@@ -810,37 +606,22 @@ export default async function handler(req, res) {
   // ─── Check for forwarded files FIRST ───
   const fileInfo = extractFileInfo(message);
   if (fileInfo && !text.startsWith("/")) {
-    // A file was forwarded/shared — prompt user with BOTH service picker and confirm
     const tgFileUrl = `tgfile:${fileInfo.file_id}:${fileInfo.file_name}`;
-    const encodedUrl = encodeURIComponent(tgFileUrl);
-    const encodedName = encodeURIComponent(fileInfo.file_name);
     const sizeStr = formatFileSize(fileInfo.file_size);
-    const settings = getUserSettings(chatId);
-    const cur = settings.defaultService || "pixeldrain";
-
-    const pixeldrainLabel = cur === "pixeldrain" ? "✅ 🎬 PixelDrain" : "🎬 PixelDrain";
-    const filekiwiLabel   = cur === "filekiwi"   ? "✅ 🥝 file.kiwi"  : "🥝 file.kiwi";
-
     await sendMessage(chatId,
-      `📎 <b>File detected!</b>\n\n` +
-      `Name: <code>${fileInfo.file_name}</code>\n` +
-      `Size: ${sizeStr}\n` +
-      `Type: ${fileInfo.type}\n\n` +
-      `Pick a service to upload to:`,
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: pixeldrainLabel, callback_data: `pick_svc_file:pixeldrain:${encodedUrl}:${encodedName}` },
-              { text: filekiwiLabel,   callback_data: `pick_svc_file:filekiwi:${encodedUrl}:${encodedName}` },
-            ],
-            [
-              { text: "❌ Cancel", callback_data: "cancel_upload" },
-            ],
-          ],
-        },
+      `📎 <b>File received</b>\n\n` +
+      `Name: <code>${escapeHtml(fileInfo.file_name)}</code>\n` +
+      `Size: ${sizeStr}\n\n` +
+      `📥 Download link added to queue. Processing...`,
+      mainMenu());
+    // Fire-and-forget dispatch
+    (async () => {
+      try {
+        await triggerUpload(tgFileUrl, fileInfo.file_name, chatId);
+      } catch (err) {
+        await sendMessage(chatId, `❌ Failed to queue: <code>${escapeHtml(err.message).slice(0, 300)}</code>`, mainMenu());
       }
-    );
+    })();
     return res.status(200).json({ ok: true });
   }
 
@@ -872,59 +653,13 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   }
 
-  // ─── Command: /service (no args) — show current + picker ───
-  if (cleanText === "/service" || cleanText === "/service" ) {
-    const settings = getUserSettings(chatId);
-    const cur = settings.defaultService || "pixeldrain";
-    await sendMessage(
-      chatId,
-      `🔄 <b>Default Service</b>\n\n` +
-      `Current: ${SERVICES[cur].label}\n\n` +
-      `Pick a new default:`,
-      { reply_markup: defaultServicePickerKeyboard(cur) }
-    );
-    return res.status(200).json({ ok: true });
-  }
-
-  // Persistent keyboard button "🔄 Service"
-  if (text === "🔄 Service") {
-    const settings = getUserSettings(chatId);
-    const cur = settings.defaultService || "pixeldrain";
-    await sendMessage(
-      chatId,
-      `🔄 <b>Default Service</b>\n\n` +
-      `Current: ${SERVICES[cur].label}\n\n` +
-      `Pick a new default:`,
-      { reply_markup: defaultServicePickerKeyboard(cur) }
-    );
-    return res.status(200).json({ ok: true });
-  }
-
-  // ─── Command: /service <name> ───
-  const serviceMatch = cleanText.match(/^\/service\s+(\S+)/);
-  if (serviceMatch) {
-    const arg = serviceMatch[1].toLowerCase();
-    let svc = null;
-    if (arg === "pixeldrain" || arg === "pixel" || arg === "pd") svc = "pixeldrain";
-    if (arg === "filekiwi" || arg === "file.kiwi" || arg === "kiwi" || arg === "fk") svc = "filekiwi";
-    if (!svc) {
-      await sendMessage(chatId, "❌ Unknown service. Use <code>/service pixeldrain</code> or <code>/service filekiwi</code>", mainMenu());
-      return res.status(200).json({ ok: true });
-    }
-    const settings = getUserSettings(chatId);
-    settings.defaultService = svc;
-    await sendMessage(chatId, `✅ Default service set to <b>${SERVICES[svc].label}</b>`, mainMenu());
-    return res.status(200).json({ ok: true });
-  }
-
   // ─── Command: /status ───
   if (cleanText === "/status") {
     const settings = getUserSettings(chatId);
-    const nextName = settings.nextFilename ? `✏️ ${settings.nextFilename}` : "➖ Default (from URL)";
-    const cur = settings.defaultService || "pixeldrain";
+    const nextName = settings.nextFilename ? `✏️ ${escapeHtml(settings.nextFilename)}` : "➖ Default (from URL)";
     await sendMessage(chatId,
       `📊 <b>Current Settings</b>\n\n` +
-      `Default service: ${SERVICES[cur].label}\n` +
+      `Service: 🎬 PixelDrain (only option)\n` +
       `Next filename: ${nextName}\n\n` +
       `💡 Send a URL to upload!`,
       mainMenu());
@@ -940,122 +675,61 @@ export default async function handler(req, res) {
     }
     const settings = getUserSettings(chatId);
     settings.nextFilename = customName;
-    await sendMessage(chatId, `✏️ Next upload will be named: <code>${customName}</code>`, mainMenu());
+    await sendMessage(chatId, `✏️ Next upload will be named: <code>${escapeHtml(customName)}</code>`, mainMenu());
     return res.status(200).json({ ok: true });
   }
 
   // ─── Helper: kick off upload flow for a URL ───
-  // If forceService is provided, skip the picker and upload directly to that service.
-  async function handleUrlUpload(urlPart, forceService) {
+  // v8.2: no service picker — go straight to PixelDrain.
+  async function handleUrlUpload(urlPart) {
     if (!looksLikeUrl(urlPart)) {
-      await sendMessage(chatId, "❌ Provide a valid URL.\nExample: <code>/upload https://example.com/file.mkv</code>", mainMenu());
+      await sendMessage(chatId, "❌ Provide a valid URL.\nExample: <code>/pixeldrain https://example.com/file.mkv</code>", mainMenu());
       return;
     }
     const sourceUrl = normalizeSourceUrl(urlPart) || urlPart;
     const filename = filenameFromUrl(sourceUrl);
 
-    if (forceService && isValidService(forceService)) {
+    // v8.2: single "queued" message — no further intermediate messages.
+    // The final consolidated result message comes from /api/result when the
+    // GitHub Actions run completes.
+    await sendMessage(chatId,
+      `📥 <b>Download link added to queue</b>\n` +
+      `📦 <code>${escapeHtml(filename)}</code>\n` +
+      `🔄 Processing...`,
+      mainMenu());
+
+    // Fire-and-forget dispatch — return HTTP 200 immediately.
+    (async () => {
       try {
-        const { finalName, finalService } = await triggerUpload(sourceUrl, filename, chatId, forceService);
-        await sendMessage(
-          chatId,
-          `⏬ <b>Uploading to ${SERVICES[finalService].label}</b>\n` +
-          `📦 <code>${finalName}</code>\n` +
-          `🔄 Downloading → Uploading...\n` +
-          `⏳ I'll message you when done!`,
-          mainMenu()
-        );
+        await triggerUpload(sourceUrl, filename, chatId);
+        // No "dispatched" follow-up message per spec ("NO intermediate 'uploading' messages")
       } catch (err) {
-        await sendMessage(chatId, `❌ Failed to queue: ${err.message}`, mainMenu());
+        await sendMessage(chatId, `❌ Failed to queue: <code>${escapeHtml(err.message).slice(0, 300)}</code>`, mainMenu());
       }
-      return;
-    }
-
-    // Show service picker (pending-id based for short callback_data)
-    // v7.6: embed URL in message text so we can recover it on callback even if the
-    // in-memory pendingUploads Map was wiped by a Vercel cold start.
-    const settings = getUserSettings(chatId);
-    const cur = settings.defaultService || "pixeldrain";
-    const pendingId = createPendingUpload(sourceUrl, filename, chatId);
-    await sendMessage(
-      chatId,
-      `🔗 <b>URL received</b>\n` +
-      `🌐 <code>${sourceUrl}</code>\n` +
-      `📦 <code>${escapeHtml(filename)}</code>\n\n` +
-      `Pick an action:`,
-      { reply_markup: servicePickerKeyboard(pendingId, cur) }
-    );
+    })();
   }
 
-  // ─── Command: /upload <url> ─── (shows picker)
-  if (cleanText.startsWith("/upload ")) {
-    const urlPart = cleanText.replace(/^\/upload\s+/, "").trim();
-    await handleUrlUpload(urlPart, null);
-    return res.status(200).json({ ok: true });
-  }
-
-  // ─── Command: /pixeldrain <url> ─── (direct to pixeldrain, no picker, auto-splits >10GB)
+  // ─── Command: /pixeldrain <url> ─── (direct to PixelDrain, auto-splits >10GB)
   if (cleanText.startsWith("/pixeldrain ")) {
     const urlPart = cleanText.replace(/^\/pixeldrain\s+/, "").trim();
-    await handleUrlUpload(urlPart, "pixeldrain");
+    await handleUrlUpload(urlPart);
     return res.status(200).json({ ok: true });
   }
 
-  // ─── Command: /filekiwi <url> ─── (direct to file.kiwi, no picker, up to 999 GiB)
-  if (cleanText.startsWith("/filekiwi ")) {
-    const urlPart = cleanText.replace(/^\/filekiwi\s+/, "").trim();
-    await handleUrlUpload(urlPart, "filekiwi");
-    return res.status(200).json({ ok: true });
-  }
-
-  // ─── Command: /raw <url> ─── (kept for compatibility, same as /upload)
-  if (cleanText.startsWith("/raw ")) {
-    const urlPart = cleanText.replace(/^\/raw\s+/, "").trim();
-    await handleUrlUpload(urlPart, null);
-    return res.status(200).json({ ok: true });
-  }
-
-  // ─── Command: /stream <url> ─── (instant Gcore CDN stream, no download)
-  if (cleanText.startsWith("/stream ")) {
-    const urlPart = cleanText.replace(/^\/stream\s+/, "").trim();
-    await handleStreamRequest(chatId, urlPart);
-    return res.status(200).json({ ok: true });
-  }
-
-  // ─── Command: /stream (no args) ─── show help
-  if (cleanText === "/stream") {
-    await sendMessage(
-      chatId,
-      "🚀 <b>Instant CDN Stream — works with ANY direct download link</b>\n\n" +
-      "Usage: <code>/stream &lt;url&gt;</code>\n\n" +
-      "<b>What works (all streamable, with pause/resume/seek):</b>\n" +
-      "✅ Pixeldrain single file — <code>/stream https://pixeldrain.com/u/abc</code> (files never expire)\n" +
-      "✅ Google video-downloads URLs (download-only links — GCore strips Content-Disposition: attachment)\n" +
-      "✅ R2 / S3 / CloudFront / Akamai / Bunny / Fastly presigned URLs (while still valid)\n" +
-      "✅ Any direct download link (raw bytes + Range support)\n\n" +
-      "<b>What doesn't work:</b>\n" +
-      "❌ Pixeldrain file lists (<code>/l/&lt;id&gt;</code>) — they're HTML pages, not raw bytes\n" +
-      "❌ The bot's own CDN URL fed back to /stream — would create an infinite loop\n" +
-      "❌ Expired presigned URLs (X-Amz-Date + X-Amz-Expires — check expiry before sending)\n" +
-      "❌ Links requiring login / cookies / auth headers\n\n" +
-      "<b>How it works:</b> GCore CDN repoints at the origin, strips Content-Disposition: attachment,\n" +
-      "and serves the file as a streamable URL. Pause / resume / seek all work. No download, no upload.",
-      mainMenu()
-    );
-    return res.status(200).json({ ok: true });
-  }
-
-  // ─── Menu button: "🚀 Stream" ───
-  if (text === "🚀 Stream") {
-    await sendMessage(
-      chatId,
-      "🚀 <b>Instant CDN Stream</b>\n\n" +
-      "Paste any video download link and I'll give you back a fast Gcore CDN URL you can stream in VLC / TV.\n\n" +
-      "<b>Or use the command directly:</b>\n" +
-      "<code>/stream https://pixeldrain.com/api/file/abc</code>\n\n" +
-      "💡 No download, no upload — Gcore edge pulls from origin on-the-fly. Seek works.",
-      mainMenu()
-    );
+  // ─── Legacy commands: /upload, /raw, /filekiwi, /stream, /service ───
+  // v8.2: removed. Reply with redirect to /pixeldrain or plain URL.
+  if (cleanText.startsWith("/upload ") || cleanText.startsWith("/raw ") || cleanText.startsWith("/filekiwi ") || cleanText.startsWith("/stream ") || cleanText.startsWith("/service")) {
+    // For /upload <url>, /raw <url>, /filekiwi <url>, /stream <url>: extract URL and dispatch to PixelDrain
+    const urlMatch = cleanText.match(/https?:\/\/\S+/i);
+    if (urlMatch) {
+      await handleUrlUpload(urlMatch[0]);
+    } else {
+      await sendMessage(chatId,
+        `💡 <b>Command simplified</b>\n\n` +
+        `Just send the URL directly, or use <code>/pixeldrain &lt;url&gt;</code>.\n\n` +
+        `All uploads go to PixelDrain (auto-splits &gt;10GB). Stream buttons appear in the result message.`,
+        mainMenu());
+    }
     return res.status(200).json({ ok: true });
   }
 
@@ -1063,13 +737,12 @@ export default async function handler(req, res) {
   if (text === "🔗 Upload link") {
     await sendMessage(
       chatId,
-      "📎 Paste your download link below, or use:\n" +
-      "<code>/stream URL</code> — 🚀 instant CDN stream (recommended for video)\n" +
-      "<code>/upload URL</code> — pick service via inline button\n" +
-      "<code>/pixeldrain URL</code> — upload to pixeldrain directly (auto-splits >10GB)\n" +
-      "<code>/filekiwi URL</code> — upload to file.kiwi directly (up to 999 GiB)\n" +
-      "<code>/rename name.mp4</code> — custom filename\n" +
-      "<code>/service</code> — set default service",
+      "📎 <b>Send me a download link</b>\n\n" +
+      "Just paste any direct download URL and I'll upload it to PixelDrain.\n" +
+      "Files &gt; 10GB are auto-split with an M3U playlist.\n\n" +
+      "<b>Example:</b>\n" +
+      "<code>/pixeldrain https://example.com/file.mkv</code>\n\n" +
+      "<code>/rename name.mp4</code> — custom filename",
       mainMenu()
     );
     return res.status(200).json({ ok: true });
@@ -1081,14 +754,66 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   }
 
-  // ─── Auto-detect URL in message → show service picker ───
+  // ─── Auto-detect URL in message → upload to PixelDrain directly ───
   const detectedUrl = extractUrlFromText(text);
   if (detectedUrl) {
-    await handleUrlUpload(detectedUrl, null);
+    await handleUrlUpload(detectedUrl);
     return res.status(200).json({ ok: true });
   }
 
   // ─── Non-URL text ───
-  await sendMessage(chatId, "📎 Send a download URL and I'll ask which service to upload to.\n\nType /help for more info.", mainMenu());
+  await sendMessage(chatId, "📎 Send a download URL and I'll upload it to PixelDrain.\n\nType /help for more info.", mainMenu());
   return res.status(200).json({ ok: true });
+}
+
+// ─── Helpers for multi-part button callbacks ──────────────────
+
+/**
+ * Extract pixeldrain IDs from the original upload-complete message text.
+ * The message contains lines like:
+ *   "1. filename.part1 → /u/ABC12345"
+ * We parse the /u/<id> portion.
+ *
+ * @param {string} messageText - the original message text
+ * @param {number} expectedCount - how many parts to expect
+ * @returns {string[]} array of pixeldrain IDs
+ */
+function extractPixeldrainIdsFromMessage(messageText, expectedCount) {
+  if (!messageText) return [];
+  const ids = [];
+  // Match /u/<id> patterns (8-char pixeldrain IDs)
+  const matches = messageText.matchAll(/\/u\/([A-Za-z0-9]{6,})/g);
+  for (const m of matches) {
+    ids.push(m[1]);
+    if (ids.length >= expectedCount) break;
+  }
+  return ids;
+}
+
+/**
+ * Build an M3U playlist from pixeldrain IDs.
+ * Uses pixeldrain raw URLs (/api/file/<id>) because they support Range requests
+ * and stream correctly in VLC. We CANNOT use Gcore URLs here because the single
+ * Gcore CDN resource can only point at one origin at a time — all parts would
+ * resolve to the last-provisioned part.
+ *
+ * @param {string[]} ids - pixeldrain file IDs
+ * @param {string} messageText - original message (for filename hints)
+ * @returns {string} M3U playlist content
+ */
+function buildM3U(ids, messageText) {
+  const lines = [
+    "#EXTM3U",
+    "#EXT-X-TARGETDURATION:10",
+    "#EXT-X-MEDIA-SEQUENCE:0",
+  ];
+  // Try to extract part filenames from the message text
+  const nameMatches = messageText ? [...messageText.matchAll(/(?:Part\s+\d+\/\d+|[01]\d)\.\s*([^→\n]+?)\s*→/g)] : [];
+  for (let i = 0; i < ids.length; i++) {
+    const partName = nameMatches[i] ? nameMatches[i][1].trim() : `Part ${i + 1}`;
+    lines.push(`#EXTINF:-1,${partName}`);
+    lines.push(`https://pixeldrain.com/api/file/${ids[i]}`);
+  }
+  lines.push("#EXT-X-ENDLIST");
+  return lines.join("\n");
 }

@@ -39,13 +39,9 @@ export default async function handler(req, res) {
   results.webhook = { url: webhookUrl, telegram: await wh.json() };
 
   // 2. Set bot commands menu
+  // v8.2: removed /stream, /upload, /filekiwi, /service, /raw — only /pixeldrain + utility commands
   const commands = [
-    { command: "stream", description: "🚀 Instant CDN stream (Gcore)" },
-    { command: "upload", description: "Upload link (asks which service)" },
-    { command: "pixeldrain", description: "Upload to pixeldrain (auto-splits >10GB)" },
-    { command: "filekiwi", description: "Upload to file.kiwi (up to 999 GiB)" },
-    { command: "service", description: "Show / change default service" },
-    { command: "raw", description: "Same as /upload" },
+    { command: "pixeldrain", description: "Upload to PixelDrain (auto-splits >10GB)" },
     { command: "rename", description: "Set custom filename for next upload" },
     { command: "status", description: "Check current settings" },
     { command: "ping", description: "Check bot latency" },
@@ -65,12 +61,10 @@ export default async function handler(req, res) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       description:
-        "🎬 StreamToBuffer Bot — Send me any file link and I'll either 🚀 stream it via Gcore CDN, or 📦 upload it to pixeldrain / file.kiwi!\n\n" +
+        "📦 StreamToBuffer Bot — Send me any file link and I'll upload it to PixelDrain (auto-splits >10GB) with Stream + Download buttons!\n\n" +
         "✨ Features:\n" +
-        "• 🚀 /stream URL — instant CDN stream (no download, no upload)\n" +
-        "• 📦 /upload URL — pick service via inline button\n" +
-        "• pixeldrain: persistent, max 10GB/file (auto-splits larger)\n" +
-        "• file.kiwi: anonymous, up to 999 GiB, 90h retention\n" +
+        "• /pixeldrain URL — upload to PixelDrain (auto-splits >10GB with M3U playlist)\n" +
+        "• Stream button — instant Gcore CDN stream (no download, no upload)\n" +
         "• Forwarded Telegram files supported\n\n" +
         "Just send a URL to get started!",
     }),
@@ -81,7 +75,7 @@ export default async function handler(req, res) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      short_description: "🚀 Instant CDN stream + 📦 file uploader (Gcore / pixeldrain / file.kiwi)",
+      short_description: "📦 PixelDrain uploader + ▶️ Gcore CDN stream (auto-splits >10GB)",
     }),
   });
 
