@@ -486,3 +486,127 @@ Once activated, the user can:
 If Gcore returns "CDN service is stopped", the bot replies with a hint to activate CDN in the portal.
 If env vars are missing, the bot replies with a hint to set them in Vercel.
 Other errors are surfaced verbatim (truncated to 400 chars).
+
+### v8.3 (2026-07-15) — GCore CDN URLs in M3U + preserve ALL audio/subtitles + fix production deploy
+
+**Trigger**: User reported that the v8.2 deploy did NOT actually take effect — production bot was still running v7.3 code with old commands (/upload, /stream, /storage, /service, /raw) and the OLD-style "Upload Complete!" message format. User also reported:
+1. Only 1 of 3 PixelDrain parts reached them (consolidated message + M3U never arrived)
+2. The uploaded video had only 1 audio track (Hindi) — the English TrueHD Atmos track was missing
+3. No subtitles
+4. The previous v8.2 assumption ("GCore can only point at one origin at a time → M3U must use PixelDrain raw URLs") was WRONG — the user explicitly verified GCore supports path-based routing for multiple parts via a single resource
+5. No inline buttons appeared in the production bot
+
+**Root causes identified**:
+- **CRITICAL**: The v8.2 Vercel deploy (ID `dpl_GJmavpvTAPntm1DD79T7Nibm7cqd`) was created with `target: null` (preview only) — it was NEVER promoted to production. The production deployment remained `dpl_H4XrLumxMftu3Q4rP7hVfYB1uSAh` (v7.3, commit `7b6a32f`). So all of v8.2's bot code (webhook.js, result.js, start.js) was sitting on a preview URL that nobody visited, while the production URL served v7.3.
+- The v8.2 comment in webhook.js said "Multi-part M3U uses PixelDrain raw URLs (not Gcore) because the single Gcore CDN resource can only point at one origin at a time" — this was an ASSUMPTION the agent made without verifying against GCore's actual capabilities. The user called this out explicitly: "you were absolutely wrong about GCore... you don't assume, you don't guess."
+- The ffmpeg split command (`ffmpeg -y -i ... -c copy -f segment -segment_time N -reset_timestamps 1 ...`) did NOT include `-map 0`, so ffmpeg's default stream-selection logic dropped the 2nd audio track (English TrueHD Atmos) and all subtitle streams. The previous agent's DEVELOPER_CONTEXT.md even noted this: "The 4 GB 'loss' is likely audio/subtitle tracks that got dropped or remuxed differently. Not a bug, but worth documenting." — but it WAS a bug, and the user explicitly complained about it.
+
+**Fixes applied**:
+
+1. **GCore CDN resource reconfigured** (via API, script: `scripts/gcore_update.js`):
+   - Resource 1003900 (`cdn.streambot.freeddns.org`) origin switched from R2 host (group 1439003) → pixeldrain.com (group 1438033)
+   - `hostHeader` updated from `53fe893e87eab15f5d6e8d244d49919d.r2.cloudflarestorage.com` → `pixeldrain.com`
+   - The existing `.*` rule (id 682648) was updated to ALSO include the `rewrite` option (body: `^/parts/(.+)$ /api/file/$1`, flag: `break`) — BUT this rewrite was tested with 6 different body/flag combinations and NONE of them actually rewrote the path. GCore forwarded `/parts/NPfen9iv` to pixeldrain.com as `/parts/NPfen9iv` (returning pixeldrain's 404 page) instead of `/api/file/NPfen9iv`. The rewrite option was REMOVED from the rule.
+   - Old leftover "test" rule (id 682647, ruleType=0 rule="/api/file/Kd4Xvyan") DELETED.
+   - Standalone rewrite rule (id 682831, created during testing) DELETED.
+   - Final rule state: 1 rule (id 682648, ruleType=1 rule=".*") with static_response_headers + response_headers_hiding_policy (NO rewrite).
+   - Verified: `HEAD https://cdn.streambot.freeddns.org/api/file/NPfen9iv` → 200, content-type: video/x-matroska, content-length: 7809043662, content-disposition: inline, accept-ranges: bytes. Direct path works perfectly.
+
+2. **`bot/api/_gcore.js` — simplified dramatically** (585 lines → 197 lines):
+   - Removed all origin-repointing logic: `listOriginGroups`, `createOriginGroup`, `findGroupForHost`, `updateResource`, `purgeResourceCache`, `ensureStreamRules`, `buildResourcePatch`, `buildStreamRuleBody`, `patchStreamRule`, `ruleMatchesSpec`, `findStreamRule`, `listResourceRules`. None of these are needed anymore since the CDN origin is permanently pixeldrain.com.
+   - `provisionStreamableUrl(sourceUrl)` now just extracts the pixeldrain ID and constructs `https://{CNAME}/api/file/{id}`. No API calls needed. Returns `{kind: "stream", streamUrl, pixeldrainId, cname}`.
+   - Added `buildGcoreStreamUrl(pixeldrainId)` helper for direct URL construction (used by webhook.js + result.js).
+   - Added `extractPixeldrainId(url)` exported helper (used by webhook.js + result.js).
+   - Added new `non_pixeldrain_url` kind for non-pixeldrain URLs — the CDN can't stream them anymore (origin is permanently pixeldrain.com). The bot tells the user to upload to PixelDrain first.
+
+3. **`bot/api/webhook.js` — updated for v8.3 architecture**:
+   - Fixed the WRONG comment about "GCore can only point at one origin at a time". Replaced with accurate v8.3 architecture description.
+   - `buildM3U(ids, messageText)` now uses `buildGcoreStreamUrl(ids[i])` for each part instead of `https://pixeldrain.com/api/file/${ids[i]}`.
+   - `stream_all` callback REWRITTEN — no more "pick a part" picker. Since each part has its own /api/file/{id} URL on the CDN edge, all parts can stream concurrently. The callback now sends ALL GCore stream URLs in ONE message.
+   - `provisionAndSendStreamUrl` updated to handle the new `non_pixeldrain_url` kind returned by the simplified `provisionStreamableUrl`.
+   - `copy_m3u` fallback (when M3U too long for chat) now uses GCore URLs too.
+   - Removed the "⚠️ Each tap repoints the CDN" warning — no longer true with v8.3.
+
+4. **`bot/api/result.js` — updated for v8.3 architecture**:
+   - Imports `buildGcoreStreamUrl` and `extractPixeldrainId` from `_gcore.js`.
+   - `buildM3UContent(filename, parts)` now uses `buildGcoreStreamUrl(pid)` for each part instead of `p.raw_url || p.url`. Falls back to pixeldrain raw URL only if ID extraction fails (shouldn't happen).
+
+5. **`upload.mjs` — fix ffmpeg split to preserve ALL streams**:
+   - Added `-map 0` to the ffmpeg segment command. This forces ffmpeg to include ALL streams from the input (every audio track, every subtitle track, attachments). Without `-map 0`, ffmpeg's default stream-selection logic drops:
+     - The 2nd audio track in multi-audio REMUX files (e.g., Hindi + English TrueHD Atmos) — only the first audio track survived.
+     - Subtitle streams (especially ASS/SSA, PGS) — silently dropped.
+     - Attachment streams (fonts for ASS subtitles) — silently dropped.
+   - Added `-segment_format matroska` to explicitly use MKV container for each part (matches the input .mkv). Without this, ffmpeg may auto-select a different container that doesn't support all stream types.
+   - Added `-segment_format_options=reserve_index_space=0` to disable Matroska's default 1MB index reservation per segment (saves disk space).
+   - Final command: `ffmpeg -y -i "${filePath}" -map 0 -c copy -f segment -segment_time ${segmentTime} -reset_timestamps 1 -segment_format matroska -segment_format_options=reserve_index_space=0 "${partPattern}"`
+
+6. **Vercel production deploy — THE critical fix**:
+   - Previous v8.2 deploy was created with `target: null` (preview only). Production was still serving v7.3.
+   - New v8.3 deploy (ID `dpl_EJkur8WBhCyVZe43kCTWKavaRAhz`) created with `target: "production"` via Vercel API.
+   - Aliases confirmed: `storage-to-uploader.vercel.app` (production), `storage-to-uploader-aicurvs-projects.vercel.app`, `storage-to-uploader-git-main-aicurvs-projects.vercel.app`.
+   - Commit: `a5c7a55` (v8.3).
+   - `GET /api/start?secret=str2buf2026sec` called successfully — webhook re-registered, commands re-registered.
+   - `getMyCommands` verified: ONLY 6 commands (/pixeldrain, /rename, /status, /ping, /about, /help). Old commands (/upload, /stream, /storage, /service, /raw) GONE.
+   - `getWebhookInfo` verified: 0 pending updates, `callback_query` in allowed_updates, IP `64.29.17.195`.
+
+**Why no `/parts/` prefix in M3U URLs**:
+
+The user's spec said `https://{GCORE_CDN_CNAME}/parts/{filename}.partN`. I tested GCore's `rewrite` option with 6 different body/flag combinations:
+1. `^/parts/(.+)$ /api/file/$1` (flag=break) — 404 from pixeldrain (path not rewritten)
+2. `/parts/(.+) /api/file/$1` (flag=break) — 404 (same)
+3. `^/parts/(.+)$ /api/file/$1` (flag=last) — 404 (same)
+4. `^/parts/(.+)$ /api/file/$1` (flag=redirect) — 404 (same)
+5. `/parts/(.+) /api/file/$1` (flag=break) — 404 (same)
+6. `/parts/(.*) /api/file/$1` (flag=break) — 404 (same)
+
+In all cases, the CDN forwarded `/parts/{id}` to pixeldrain.com as `/parts/{id}` (not `/api/file/{id}`), and pixeldrain returned its 404 HTML page. The rewrite option simply did not work — possibly a GCore bug, possibly an undocumented format requirement.
+
+**Decision**: Use `/api/file/{id}` directly in the M3U. This:
+- Routes through GCore edge (verified: 200, video/x-matroska, 7.8GB, all streaming headers applied)
+- Satisfies the user's intent (GCore CDN URLs in M3U for edge caching + IP rate limit bypass)
+- No rewrite rule needed (the path is forwarded as-is to pixeldrain.com which has /api/file/{id} endpoint)
+
+The M3U looks like:
+```
+#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:-1,Hoppers_part_000.mkv
+https://cdn.streambot.freeddns.org/api/file/NPfen9iv
+#EXTINF:-1,Hoppers_part_001.mkv
+https://cdn.streambot.freeddns.org/api/file/qvXwDp4H
+#EXTINF:-1,Hoppers_part_002.mkv
+https://cdn.streambot.freeddns.org/api/file/6sCWMHvn
+#EXT-X-ENDLIST
+```
+
+**GCore CDN resource final state** (resource 1003900):
+- cname: `cdn.streambot.freeddns.org`
+- originGroup: 1438033 (`pixeldrain.com`)
+- originProtocol: HTTPS
+- hostHeader: `pixeldrain.com`
+- sslEnabled: true (Let's Encrypt auto-renew)
+- Resource-level options: slice enabled, ignoreQueryString=false, cors=*, edge_cache_settings=4d, ignore_cookie=true, stale=[error,updating], disable_proxy_force_ranges=false, static_response_headers (Content-Disposition: inline, Accept-Ranges: bytes, Cache-Control: public max-age=86400), response_headers_hiding_policy (show only streaming-relevant headers)
+- Rules: 1 rule (id 682648, ruleType=1 rule=".*", weight=2) with the same streaming options at the rule level (where they are actually applied per GCore docs)
+
+**Lesson learned (for future AI agents)**:
+1. **NEVER assume a CDN/Cloud service's capabilities without verifying via API + docs.** The v8.2 agent assumed GCore couldn't route multiple parts via one resource — WRONG. Always test with a real API call.
+2. **ALWAYS verify a Vercel deploy was promoted to PRODUCTION** by checking `target === "production"` and the production alias. A `target: null` deploy goes to a preview URL that nobody visits.
+3. **ALWAYS call `/api/start?secret=...` after deploying** to register the webhook + commands. Without this, the old BotFather command menu persists.
+4. **ALWAYS verify via `getMyCommands`** that the command menu was actually updated.
+5. **NEVER document a known data-loss bug as "not a bug"**. The v8.2 agent noted that ffmpeg split dropped 4GB of audio/subtitles and called it "expected behavior". It was a bug — `-map 0` fixes it.
+6. **ffmpeg `-c copy` does NOT preserve all streams by default** when using the segment muxer. Always add `-map 0` to force inclusion of ALL streams (video, all audio tracks, all subtitles, attachments).
+7. **GCore CDN rules**: only ONE rule fires per request — the HIGHEST-WEIGHT matching rule. Lower-weight matches are SILENTLY SKIPPED. If you have a catch-all `.*` rule (weight=2), it will override any specific-path rule (weight=1). To make a specific rule win, either raise its weight above the catch-all, OR merge its options INTO the catch-all rule.
+8. **GCore CDN `rewrite` option**: tested with 6 body/flag combinations, NONE of them actually rewrote the path. May be a GCore bug. Workaround: use a path that the origin already supports (e.g., `/api/file/{id}` for pixeldrain.com) instead of trying to rewrite.
+
+**Files modified in v8.3**:
+- `bot/api/_gcore.js` (585 → 197 lines, simplified)
+- `bot/api/webhook.js` (updated comments, buildM3U, stream_all callback, provisionAndSendStreamUrl, copy_m3u fallback)
+- `bot/api/result.js` (updated buildM3UContent, imports from _gcore.js)
+- `upload.mjs` (added -map 0, -segment_format matroska, -segment_format_options=reserve_index_space=0)
+- `DEVELOPER_CONTEXT.md` (this section)
+
+**Commits**:
+- `a5c7a55` — v8.3: GCore CDN URLs in M3U + preserve all audio/subtitles + fix production deploy
+
+**Verification status**: Code deployed to production, commands verified via getMyCommands, webhook healthy. End-to-end test with the R2 REMUX link PENDING — waiting for user to send a fresh presigned URL (the previous one has likely expired).
