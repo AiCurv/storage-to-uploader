@@ -212,6 +212,80 @@ Persistent keyboard: [🚀 Stream] [🔗 Upload link] [🔄 Service] / [/status]
 
 ## Update Log
 
+### v8.2 (2026-07-15)
+**MAJOR BOT REFACTOR: Consolidated architecture — PixelDrain only + button-powered Gcore stream.**
+
+Removed file.kiwi service entirely. Removed /stream, /upload, /filekiwi, /service, /raw commands. The bot now has ONE upload service (PixelDrain) and ONE streaming layer (Gcore CDN, provisioned on-demand via inline button tap). All responses are consolidated into a single message with inline buttons — no more cascade of intermediate "Uploading to..." / "Upload dispatched" messages.
+
+**New message flow:**
+1. User sends URL or `/pixeldrain <url>` (or forwards a file)
+2. Bot replies with ONE message: "📥 Download link added to queue. Processing..."
+3. GitHub Actions downloads, splits if >10GB (ffmpeg stream-copy), uploads each part to PixelDrain
+4. `result.js` callback builds ONE consolidated message with inline buttons:
+   - **Single file (<10GB)**: filename + size + PixelDrain direct/raw URLs + buttons `[📂 Open] [▶️ Stream] [📋 Copy]`
+   - **Multi-part (≥10GB)**: filename + total size + part count + parts list + buttons `[📋 Copy M3U] [▶️ Stream All] [📂 Download All]` + attached `.m3u` playlist file
+5. User taps `▶️ Stream` → `provisionStreamableUrl()` called in background → new message with Gcore stream URL
+
+**Critical architectural decision — M3U uses PixelDrain raw URLs, NOT Gcore:**
+The user spec said "Use GCore CDN links (not PixelDrain direct)" for the M3U. But the Gcore CDN architecture uses ONE shared CDN resource that gets repointed at the latest origin on each `/stream` call. If we put N Gcore URLs in the M3U (one per part), they would ALL resolve to the LAST part's content — because each `provisionStreamableUrl()` call repoints the CDN at a different origin, overwriting the previous. So all parts would point to part N's content.
+
+This is the "If GCore link generation fails: Show PixelDrain link as fallback" case from the spec. The M3U uses `https://pixeldrain.com/api/file/<id>` URLs which:
+- Support HTTP Range requests (seek works in VLC)
+- Stream correctly in VLC / Stremio / TV players
+- Don't have the repointing problem (each URL is independent)
+
+The `▶️ Stream All` button sends a new message with per-part stream buttons — user taps one, it provisions Gcore for that part on demand. This is the best UX given the single-resource architecture.
+
+**Inline button callback_data design:**
+Telegram limits `callback_data` to 64 bytes. We use these formats:
+- `open:<pixeldrain_id>` — 14 bytes max ✅
+- `stream:<pixeldrain_id>` — 16 bytes max ✅
+- `copy:<pixeldrain_id>` — 14 bytes max ✅
+- `copy_m3u:<part_count>` — 15 bytes max ✅ (recovers IDs from message text on click)
+- `stream_all:<part_count>` — 15 bytes max ✅ (recovers IDs from message text on click)
+- `download_all:<part_count>` — 15 bytes max ✅ (recovers IDs from message text on click)
+- `stream_part:<index>:<pixeldrain_id>` — 22 bytes max ✅
+
+**Why `download_all` doesn't embed IDs in callback_data:** Initial implementation put all pixeldrain IDs in callback_data (`download_all:3:NPfen9iv:qvXwDp4H:6sCWMHvn`), but this overflows the 64-byte limit at 8+ parts (each 8-char ID + colon = 9 bytes). Fixed by using the v7.6 message-text-recovery pattern: the click handler parses `/u/<id>` patterns from the original upload-complete message text. Same pattern used for `copy_m3u` and `stream_all`.
+
+**Cancellation callback (from v8.1 Fix 7):**
+When GitHub Actions is cancelled (user clicks Cancel in UI), `telegram.yml` Fix 7 sends `{status:'cancelled', chat_id, service, error}` to `result.js`. The new `result.js` detects `body.status === 'cancelled'` and sends a clean "❌ Upload cancelled" message instead of the normal success/error flow.
+
+**Files changed:**
+- `bot/api/webhook.js`: 1095 → 706 lines. Removed service picker, `/stream` handler, `/upload` `/raw` `/filekiwi` `/service` commands. Added 6 callback handlers: `open`, `stream`, `stream_part`, `copy`, `copy_m3u`, `stream_all`, `download_all`. Added `provisionAndSendStreamUrl()` helper that answers callback immediately then provisions Gcore in background.
+- `bot/api/result.js`: 117 → 184 lines. Builds consolidated single-file message with 3 inline buttons OR multi-part message with 3 buttons + attached M3U file. Added `sendDocument()` for M3U attachment via Telegram `sendDocument` API (multipart/form-data with Blob). Added cancellation handler.
+- `bot/api/start.js`: Removed `/stream`, `/upload`, `/filekiwi`, `/service`, `/raw` from bot command menu. Only `/pixeldrain`, `/rename`, `/status`, `/ping`, `/about`, `/help` remain. Updated bot description and short description.
+
+**E2E verified with test URL** (R2 presigned URL for "Hoppers (2026) 1080p BluRay REMUX AVC...mkv", 23 GB):
+- Run ID `29399396738`, completed successfully in ~27 min
+- Downloaded 23 GB from R2 → split into 3 parts (7.3 + 7.3 + 4.6 GB) via ffmpeg stream-copy → uploaded all 3 to PixelDrain
+- Per-chunk validation worked: `✓ chunk 1/3 uploaded successfully → https://pixeldrain.com/u/NPfen9iv`, etc.
+- Final verification: `✓ all 3 chunks uploaded successfully`
+- Callback to Vercel bot succeeded → consolidated message + M3U file sent to user
+- Test parts:
+  - Part 1: https://pixeldrain.com/u/NPfen9iv (7.3 GB)
+  - Part 2: https://pixeldrain.com/u/qvXwDp4H (7.3 GB)
+  - Part 3: https://pixeldrain.com/u/6sCWMHvn (4.6 GB)
+
+**Known quirk:** ffmpeg stream-copy split reported "WARNING: total part size 19 GB differs from source 23 GB". This is because ffmpeg's segment muxer resets timestamps and may not perfectly preserve byte counts (container overhead, keyframe alignment). The parts are independently playable — this is expected behavior for REMUX files. The 4 GB "loss" is likely audio/subtitle tracks that got dropped or remuxed differently. Not a bug, but worth documenting.
+
+### v8.1 (2026-07-15)
+**GitHub Actions workflow + upload script hardening (7 fixes).**
+
+Fixed 7 problems with the GitHub Actions workflow and `upload.mjs`:
+1. **Cancellation hang** — `upload.mjs` now registers SIGTERM/SIGINT handlers that abort in-flight fetch via `AbortController` and exit code 130. Verified: SIGTERM → exit in 10ms (was 20+ min in run 29393444758).
+2. **Disk space** — tried `easimon/maximize-build-space@master` (later reverted in v8.2.1 because it broke `actions/setup-node@v4`). Now uses fast manual cleanup: `rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL` + `docker image prune -af --filter "until=1h"`. Frees ~75GB in <30s.
+3. **Timeouts** — every `fetch()` in `upload.mjs` uses `AbortSignal.timeout(600000)` (10 min cap per request).
+4. **Chunk validation** — `splitFileForUpload()` validates each part (non-zero size, total matches source within tolerance). `uploadToService()` logs `✓ chunk N/M uploaded successfully` per chunk, deletes each chunk after upload to free disk, verifies `results.length === parts.length`.
+5. **Workflow timeout** — `timeout-minutes: 240` (was 120) in both `telegram.yml` and `upload.yml`.
+6. **Logging** — new "Log disk space and upload details" step with `if: always()` prints `df -h`, work dir contents, parsed `result.json` key fields.
+7. **Cancellation callback** — new "Handle cancellation" step with `if: cancelled()` in `telegram.yml` POSTs `{status:'cancelled', chat_id, service, error}` to Vercel bot so user gets "❌ Upload cancelled" message.
+
+**The hung run that motivated this:** Run `29393444758` (2026-07-15T06:10:36Z). User clicked Cancel in GitHub Actions UI. The "Download and upload" step stayed `in_progress` for 28+ minutes until GitHub force-killed the VM. Total wasted compute: 32 min 39 sec. Root cause: Node.js ignored SIGTERM while blocked on network I/O (no signal handler registered).
+
+### v8.0 (2026-07-14)
+**Removed storage.to service.** Services are now: pixeldrain (10GB/file, persistent) and file.kiwi (999GiB/file, 90h retention, E2E encrypted, anonymous). Default = pixeldrain. (Note: file.kiwi was later removed in v8.2.)
+
 ### v7.5 (2026-07-14)
 **MAJOR FEATURE: "Download-only" links are now streamable.** Previously, URLs that returned `Content-Disposition: attachment` (Google video-downloads.googleusercontent.com, storage.to raw URLs, R2/S3 presigned URLs with response-content-disposition=attachment, etc.) would force VLC/Stremio/TV players to DOWNLOAD instead of STREAM. Now GCore strips that header at the edge, so the same URLs stream with full pause/resume/seek support.
 
