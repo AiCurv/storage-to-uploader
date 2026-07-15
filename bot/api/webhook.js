@@ -30,7 +30,7 @@
 // Any direct URL sent as text triggers upload to PixelDrain (no picker).
 // Forwarded files (documents, videos, audio, photos) are also uploaded.
 
-import { provisionInstantStream, repointToPixeldrain, buildGcoreStreamUrl, extractPixeldrainId } from "./_gcore.js";
+import { provisionInstantStream, buildGcoreStreamUrl, extractPixeldrainId } from "./_gcore.js";
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
 
@@ -643,6 +643,7 @@ export default async function handler(req, res) {
       await answerCallbackQuery(cb.id, "⏳ Provisioning GCore stream...");
 
       // Edit the confirm message to show "provisioning" state
+      // v8.6: Use clickable <a href> link instead of <code> plain text.
       try {
         await fetch(`${TELEGRAM_API}/editMessageText`, {
           method: "POST",
@@ -650,7 +651,10 @@ export default async function handler(req, res) {
           body: JSON.stringify({
             chat_id: chatId,
             message_id: cb.message?.message_id,
-            text: `🚀 <b>GCore Stream provisioning...</b>\n\n🔗 <code>${escapeHtml(sourceUrl).slice(0, 200)}</code>\n⏳ Repointing CDN edge (2-5s)...`,
+            text:
+              `🚀 <b>GCore Stream provisioning...</b>\n\n` +
+              `🔗 <a href="${escapeHtml(sourceUrl)}">Source URL</a>\n` +
+              `⏳ Repointing CDN edge (2-5s)...`,
             parse_mode: "HTML",
             disable_web_page_preview: true,
           }),
@@ -782,6 +786,10 @@ export default async function handler(req, res) {
       await answerCallbackQuery(cb.id, "⏳ Starting upload...");
 
       // Edit the confirm message to show "processing" state
+      // v8.6: Show the source URL as a CLICKABLE LINK (not just <code> plain text).
+      // User feedback: "before it was showing link, now it's just plain text".
+      // Previously the URL was hidden; only the filename was shown in <code>.
+      // Now we show: filename + clickable source URL so user can verify/click.
       const filename = filenameFromUrl(normalizeSourceUrl(sourceUrl) || sourceUrl);
       try {
         await fetch(`${TELEGRAM_API}/editMessageText`, {
@@ -790,26 +798,33 @@ export default async function handler(req, res) {
           body: JSON.stringify({
             chat_id: chatId,
             message_id: cb.message?.message_id,
-            text: `📥 <b>Download link added to queue</b>\n📦 <code>${escapeHtml(filename)}</code>\n🔄 Processing...`,
+            text:
+              `📥 <b>Download link added to queue</b>\n` +
+              `📦 <code>${escapeHtml(filename)}</code>\n` +
+              `🔗 <a href="${escapeHtml(sourceUrl)}">Source URL</a>\n` +
+              `🔄 Processing...`,
             parse_mode: "HTML",
             disable_web_page_preview: true,
           }),
         });
       } catch {}
 
-      // v8.5: Repoint CDN back to pixeldrain.com so the post-upload GCore
-      // stream link in the result message works. This is needed because the
-      // user may have previously used [🚀 GCore Stream] which repointed the
-      // origin to some other host. We repoint BEFORE dispatching so by the
-      // time the upload finishes, the CDN is ready to serve from pixeldrain.
-      try {
-        await repointToPixeldrain();
-      } catch (err) {
-        console.error("[confirm_upload] repointToPixeldrain failed (non-fatal):", err.message);
-        // Non-fatal — the upload still proceeds; the GCore link in result
-        // may not work immediately but will work once origin is repointed.
-      }
-
+      // v8.6 FIX: Previously this handler called repointToPixeldrain() before
+      // dispatching. That was WRONG — it broke any URL the user had previously
+      // streamed via GCore (e.g. cdn.streambot.freeddns.org/<token>). Here's why:
+      //
+      //   1. User taps [🚀 GCore Stream] on a google URL → origin repointed to
+      //      video-downloads.googleusercontent.com → user gets GCore URL.
+      //   2. User sends that GCore URL back to bot, taps [Upload to PixelDrain].
+      //   3. OLD CODE: confirm_upload repoints origin → pixeldrain.com (BUG!)
+      //   4. GitHub Actions HEAD-requests the GCore URL → GCore proxies to
+      //      pixeldrain.com/<token> → pixeldrain returns HTML 404 page.
+      //   5. upload.mjs sees text/html, throws "source returned HTML".
+      //
+      // The repoint is now done in result.js AFTER the upload completes (so
+      // the post-upload GCore link works), NOT here (where it would break
+      // an in-flight GCore-streamed source URL).
+      //
       // Dispatch to GitHub Actions (fire-and-forget)
       (async () => {
         try {

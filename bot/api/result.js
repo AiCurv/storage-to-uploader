@@ -13,7 +13,7 @@
 // through the GCore edge with caching + IP rate limit bypass. All parts can be
 // streamed concurrently (no origin repointing conflict).
 
-import { buildGcoreStreamUrl, extractPixeldrainId } from "./_gcore.js";
+import { buildGcoreStreamUrl, extractPixeldrainId, repointToPixeldrain } from "./_gcore.js";
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
 
@@ -119,6 +119,32 @@ export default async function handler(req, res) {
   const allowed = String(process.env.TELEGRAM_ALLOWED_ID || "");
   if (!chatId || (allowed && chatId !== allowed)) {
     return res.status(403).json({ ok: false, error: "unauthorized chat" });
+  }
+
+  // v8.6: Repoint GCore CDN origin back to pixeldrain.com so the post-upload
+  // GCore stream links in the result message work. This was previously done
+  // in webhook.js confirm_upload, but that broke uploads of GCore-streamed
+  // source URLs (the repoint would happen BEFORE the download completed,
+  // causing GCore to proxy the source URL to pixeldrain.com which returned
+  // HTML 404 → upload.mjs threw "source returned HTML").
+  //
+  // Now we repoint HERE, after the upload is already on pixeldrain. The
+  // download is complete, so changing the origin doesn't affect it. We race
+  // the repoint against a 4s timeout so the result message isn't delayed
+  // more than necessary (Vercel result.js maxDuration=10s).
+  //
+  // If the repoint times out or fails, we still send the result message —
+  // the GCore links may not work for the first few seconds until the
+  // background repoint + cache purge completes.
+  if (!body.error && (body.url || (body.parts && body.parts.length > 0)) && body.status !== "cancelled") {
+    try {
+      await Promise.race([
+        repointToPixeldrain(),
+        new Promise((resolve) => setTimeout(resolve, 4000)),
+      ]);
+    } catch (err) {
+      console.error("[result] repointToPixeldrain failed (non-fatal):", err.message);
+    }
   }
 
   // ── Cancellation callback (from telegram.yml Fix 7) ──
