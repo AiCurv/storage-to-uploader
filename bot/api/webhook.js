@@ -30,7 +30,7 @@
 // Any direct URL sent as text triggers upload to PixelDrain (no picker).
 // Forwarded files (documents, videos, audio, photos) are also uploaded.
 
-import { provisionStreamableUrl, buildGcoreStreamUrl, extractPixeldrainId } from "./_gcore.js";
+import { provisionInstantStream, repointToPixeldrain, buildGcoreStreamUrl, extractPixeldrainId } from "./_gcore.js";
 
 const TELEGRAM_API = "https://api.telegram.org/bot" + (process.env.TELEGRAM_BOT_TOKEN || "");
 
@@ -73,14 +73,18 @@ function startMenuKeyboard() {
   };
 }
 
-// Inline keyboard for confirming an upload. Sent as a reply to the user's
-// URL message, so the callback handler can read the URL from
+// Inline keyboard for confirming an upload OR instant stream. Sent as a reply
+// to the user's URL message, so the callback handler can read the URL from
 // callback_query.message.reply_to_message.text.
+// v8.5: 3 options — [🚀 GCore Stream] [📦 Upload to PixelDrain] [❌ Cancel]
 function confirmUploadKeyboard() {
   return {
     inline_keyboard: [
       [
+        { text: "🚀 GCore Stream", callback_data: "gcore_stream:yes" },
         { text: "📦 Upload to PixelDrain", callback_data: "confirm_upload:yes" },
+      ],
+      [
         { text: "❌ Cancel", callback_data: "confirm_upload:no" },
       ],
     ],
@@ -351,23 +355,22 @@ function formatFileSize(bytes) {
 
 // ─── On-demand Gcore stream URL construction (button-powered) ────
 //
-// v8.3: The CDN resource's origin is PERMANENTLY set to pixeldrain.com.
-// No origin repointing is needed — we just construct the GCore URL for the pixeldrain ID.
-// This means multiple parts can ALL be streamed concurrently (each has its own
-// /api/file/{id} URL on the same CDN edge), with edge caching + IP rate limit bypass.
-//
-// When the user taps "▶️ Stream" or "▶️ Stream Part N", we:
-//   1. answerCallbackQuery IMMEDIATELY (clears the button spinner in <1s)
-//   2. send a "⏳ Constructing Gcore stream URL..." message so user has feedback
-//   3. call provisionStreamableUrl(pixeldrain_raw_url) in the background
-//   4. on success → send a new message with the Gcore stream URL
-//   5. on failure → send a new message with the PixelDrain raw URL as fallback
+// v8.5: Two stream paths:
+//   1. INSTANT stream (user taps [🚀 GCore Stream] on a pasted URL):
+//      - For non-pixeldrain URLs: repoint CDN origin to the URL's host, return
+//        https://cdn.streambot.freeddns.org{path}?{query}
+//      - For pixeldrain URLs: no repointing, return /parts/{id}
+//   2. POST-UPLOAD stream (user taps [▶️ Stream] on an upload-complete message):
+//      - File is already on pixeldrain, origin is already pixeldrain.com
+//      - Just return /parts/{id}
 
-async function provisionAndSendStreamUrl(chatId, pixeldrainRawUrl, label, callbackQueryId) {
-  // Already answered the callback query before calling this — no need to answer again.
+async function provisionAndSendStreamUrl(chatId, sourceUrl, label, callbackQueryId) {
   try {
-    const r = await provisionStreamableUrl(pixeldrainRawUrl);
+    const r = await provisionInstantStream(sourceUrl);
     if (r.kind === "stream") {
+      const repointNote = r.repointed
+        ? `\n\n🔧 <b>CDN repointed to ${escapeHtml(r.host)}</b> — edge cache warming up (2-5s)`
+        : "";
       const lines = [
         `▶️ <b>Gcore Stream Ready</b>${label ? ` — ${escapeHtml(label)}` : ""}`,
         "",
@@ -377,16 +380,14 @@ async function provisionAndSendStreamUrl(chatId, pixeldrainRawUrl, label, callba
         "• Paste into VLC / Stremio / TV media player",
         "• Pause / resume / seek all work",
         "• First byte may take ~2-5s (cache warm-up)",
-        "",
-        "✅ <b>Multi-part friendly:</b> each part has its own URL on the CDN edge.",
-        "Stream different parts concurrently — no repointing conflict.",
       ];
-      if (r.presignedExpiresAt) {
-        const expiryDate = new Date(r.presignedExpiresAt);
-        const hoursLeft = Math.max(0, (expiryDate.getTime() - Date.now()) / 3600000);
+      if (r.repointed) {
         lines.push("");
-        lines.push(`⏰ Source URL expires in ~${hoursLeft.toFixed(1)} hours`);
+        lines.push(`✅ <b>Instant stream</b> — no download, no upload`);
+        lines.push(`🌐 Source: <code>${escapeHtml(r.host)}</code>`);
       }
+      lines.push("");
+      lines.push("✅ <b>Multi-part friendly:</b> each part has its own URL on the CDN edge.");
       await sendMessage(chatId, lines.join("\n"), mainMenu());
       return;
     }
@@ -396,37 +397,20 @@ async function provisionAndSendStreamUrl(chatId, pixeldrainRawUrl, label, callba
         mainMenu());
       return;
     }
-    if (r.kind === "expired") {
-      await sendMessage(chatId,
-        `⏰ <b>Source URL expired</b>\n\nThe PixelDrain source has expired (at ${r.expiredAt}).\n\nFallback direct link:\n${pixeldrainRawUrl}`,
-        mainMenu());
-      return;
-    }
     if (r.kind === "pixeldrain_list") {
       await sendMessage(chatId,
-        `📋 <b>PixelDrain list — not a single file</b>\n\nOpen the list, click a file, copy its /u/<id> URL and try again.\n\nFallback:\n${pixeldrainRawUrl}`,
+        `📋 <b>PixelDrain list — not a single file</b>\n\nOpen the list, click a file, copy its /u/<id> URL and try again.\n\nFallback:\n${sourceUrl}`,
         mainMenu());
       return;
     }
-    if (r.kind === "non_pixeldrain_url") {
-      // v8.3: CDN origin is permanently pixeldrain.com, can't stream non-pixeldrain URLs
-      await sendMessage(chatId,
-        `⚠️ <b>Cannot stream this URL directly</b>\n\n` +
-        `The CDN is configured for PixelDrain only. To stream this file, upload it to PixelDrain first.\n\n` +
-        `Original URL:\n<code>${escapeHtml(r.originalUrl).slice(0, 300)}</code>`,
-        mainMenu());
-      return;
-    }
-    // Unknown kind — fall back to direct URL
     await sendMessage(chatId,
-      `⚠️ Could not provision Gcore stream. Direct link:\n${pixeldrainRawUrl}`,
+      `⚠️ Could not provision Gcore stream. Direct link:\n${sourceUrl}`,
       mainMenu());
   } catch (err) {
     console.error("[stream] error:", err.message, err.body || "");
-    // Per spec: If GCore link generation fails: Show PixelDrain link as fallback
     await sendMessage(chatId,
-      `⚠️ <b>Gcore stream failed</b> — showing PixelDrain direct link as fallback:\n\n` +
-      `<code>${escapeHtml(pixeldrainRawUrl)}</code>\n\n` +
+      `⚠️ <b>Gcore stream failed</b> — showing direct link as fallback:\n\n` +
+      `<code>${escapeHtml(sourceUrl)}</code>\n\n` +
       `<code>${escapeHtml(err.message || "unknown error").slice(0, 200)}</code>`,
       mainMenu());
   }
@@ -451,16 +435,19 @@ export default async function handler(req, res) {
 
     // ── Button: Copy direct URL (single file) ──
     // Format: copy:<pixeldrain_id>
+    // v8.5: Includes BOTH PixelDrain AND GCore URLs
     if (data.startsWith("copy:")) {
       const pixeldrainId = data.slice(5);
       const directUrl = `https://pixeldrain.com/u/${pixeldrainId}`;
       const rawUrl = `https://pixeldrain.com/api/file/${pixeldrainId}`;
-      await answerCallbackQuery(cb.id, "📋 URL ready below 👇");
+      const gcoreUrl = buildGcoreStreamUrl(pixeldrainId);
+      await answerCallbackQuery(cb.id, "📋 URLs ready below 👇");
       await sendMessage(chatId,
         `📋 <b>Copy these URLs:</b>\n\n` +
-        `🌐 <b>View page:</b>\n<code>${directUrl}</code>\n\n` +
-        `⬇️ <b>Direct download:</b>\n<code>${rawUrl}</code>\n\n` +
-        `<i>Long-press either URL → Copy</i>`,
+        `🌐 <b>PixelDrain view:</b>\n<code>${directUrl}</code>\n\n` +
+        `⬇️ <b>PixelDrain raw:</b>\n<code>${rawUrl}</code>\n\n` +
+        `🚀 <b>GCore stream:</b>\n<code>${gcoreUrl}</code>\n\n` +
+        `<i>Long-press any URL → Copy</i>`,
         mainMenu());
       return res.status(200).json({ ok: true });
     }
@@ -616,6 +603,71 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
+    // ── Button: Instant GCore Stream (no upload) ──
+    // v8.5: User taps [🚀 GCore Stream] on the confirm message.
+    // We read the URL from the replied-to message, repoint the CDN origin to
+    // the URL's host (if non-pixeldrain), and return the GCore stream URL.
+    // Format: gcore_stream:yes
+    if (data.startsWith("gcore_stream:")) {
+      const choice = data.split(":")[1];
+      if (choice !== "yes") {
+        await answerCallbackQuery(cb.id, "❌ Cancelled");
+        try {
+          await fetch(`${TELEGRAM_API}/editMessageText`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: cb.message?.message_id,
+              text: "❌ <b>Cancelled.</b>",
+              parse_mode: "HTML",
+              disable_web_page_preview: true,
+            }),
+          });
+        } catch {}
+        return res.status(200).json({ ok: true });
+      }
+
+      // Extract URL from the replied-to message
+      const originalText = cb.message?.reply_to_message?.text || "";
+      const sourceUrl = extractUrlFromText(originalText);
+      if (!sourceUrl) {
+        await answerCallbackQuery(cb.id, "⚠️ Could not find URL");
+        await sendMessage(chatId,
+          "⚠️ <b>Could not recover the URL.</b>\n\nPlease send the download link again.",
+          mainMenu());
+        return res.status(200).json({ ok: true });
+      }
+
+      // Acknowledge immediately (<1s deadline)
+      await answerCallbackQuery(cb.id, "⏳ Provisioning GCore stream...");
+
+      // Edit the confirm message to show "provisioning" state
+      try {
+        await fetch(`${TELEGRAM_API}/editMessageText`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: cb.message?.message_id,
+            text: `🚀 <b>GCore Stream provisioning...</b>\n\n🔗 <code>${escapeHtml(sourceUrl).slice(0, 200)}</code>\n⏳ Repointing CDN edge (2-5s)...`,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+          }),
+        });
+      } catch {}
+
+      // Fire-and-forget: provision the stream URL and send it as a new message
+      provisionAndSendStreamUrl(chatId, sourceUrl, "", cb.id)
+        .catch(err => {
+          console.error("[gcore_stream callback bg] error:", err.message);
+          sendMessage(chatId,
+            `❌ <b>GCore stream failed:</b>\n<code>${escapeHtml(err.message || "").slice(0, 300)}</code>`,
+            mainMenu()).catch(() => {});
+        });
+      return res.status(200).json({ ok: true });
+    }
+
     // ── Button: Confirm upload of a forwarded Telegram file ──
     // v8.4: For forwarded files (no URL in user message), we stored the
     // tgfile: URL in an HTML comment in the confirm message text. On tap,
@@ -744,6 +796,19 @@ export default async function handler(req, res) {
           }),
         });
       } catch {}
+
+      // v8.5: Repoint CDN back to pixeldrain.com so the post-upload GCore
+      // stream link in the result message works. This is needed because the
+      // user may have previously used [🚀 GCore Stream] which repointed the
+      // origin to some other host. We repoint BEFORE dispatching so by the
+      // time the upload finishes, the CDN is ready to serve from pixeldrain.
+      try {
+        await repointToPixeldrain();
+      } catch (err) {
+        console.error("[confirm_upload] repointToPixeldrain failed (non-fatal):", err.message);
+        // Non-fatal — the upload still proceeds; the GCore link in result
+        // may not work immediately but will work once origin is repointed.
+      }
 
       // Dispatch to GitHub Actions (fire-and-forget)
       (async () => {
@@ -960,10 +1025,11 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         chat_id: chatId,
         text:
-          `📦 <b>Confirm upload?</b>\n\n` +
+          `📦 <b>What do you want to do?</b>\n\n` +
           `🔗 <code>${escapeHtml(sourceUrl).slice(0, 300)}</code>\n` +
           `📝 Filename: <code>${escapeHtml(filename)}</code>\n\n` +
-          `Tap <b>Upload</b> to send to PixelDrain (auto-splits &gt;10GB).`,
+          `🚀 <b>GCore Stream</b> — instant CDN stream (no download, no upload)\n` +
+          `📦 <b>Upload to PixelDrain</b> — download + upload (auto-splits &gt;10GB)`,
         parse_mode: "HTML",
         disable_web_page_preview: true,
         reply_to_message_id: message.message_id,

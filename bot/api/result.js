@@ -77,9 +77,10 @@ function extractPixeldrainIdLocal(url) {
 
 /**
  * Build the M3U playlist content for multi-part uploads.
- * v8.3: Uses Gcore CDN URLs (https://{GCORE_CDN_CNAME}/api/file/{id}) for ALL parts.
- * The CDN origin is permanently pixeldrain.com, so each /api/file/{id} request
- * routes through the GCore edge with caching + IP rate limit bypass.
+ * v8.5: Uses Gcore CDN URLs (https://{GCORE_CDN_CNAME}/parts/{id}) for ALL parts.
+ * The CDN resource has a rewrite rule: /parts/(.*) → /api/file/$1, so each
+ * /parts/{id} request routes through the GCore edge with caching + IP rate
+ * limit bypass. Origin is pixeldrain.com (repointed back in confirm_upload).
  */
 function buildM3UContent(filename, parts) {
   const lines = [
@@ -93,7 +94,7 @@ function buildM3UContent(filename, parts) {
     const pid = extractPixeldrainId(p.url) || extractPixeldrainId(p.raw_url);
     lines.push(`#EXTINF:-1,${partName}`);
     if (pid) {
-      // GCore CDN URL — edge cached, IP rate limit bypass, streaming headers applied
+      // GCore CDN URL via /parts/ rewrite — edge cached, IP rate limit bypass
       lines.push(buildGcoreStreamUrl(pid));
     } else {
       // Fallback: pixeldrain raw URL (shouldn't happen, but just in case)
@@ -146,15 +147,7 @@ export default async function handler(req, res) {
     const parts = body.parts;
     const partCount = parts.length;
 
-    // Build inline keyboard buttons
-    // callback_data limit: 64 bytes
-    // - copy_m3u:<count>             — 15 bytes max  ✅
-    // - stream_all:<count>           — 15 bytes max  ✅
-    // - download_all:<count>         — 15 bytes max  ✅  (we recover IDs from message text on click)
-    //
-    // NOTE: We DON'T put pixeldrain IDs in callback_data for download_all because
-    // 8+ parts would overflow the 64-byte limit. Instead, the click handler in
-    // webhook.js parses the /u/<id> patterns from the original message text.
+    // v8.5: Build inline keyboard buttons
     const inlineKeyboard = [
       [
         { text: "📋 Copy M3U", callback_data: `copy_m3u:${partCount}` },
@@ -165,14 +158,23 @@ export default async function handler(req, res) {
       ],
     ];
 
-    // Build the parts list text
-    const partsLines = [``, `<b>Parts:</b>`];
+    // v8.5: Build the parts list text — show BOTH PixelDrain AND GCore links
+    // for each part, so the user can verify all parts uploaded and has both
+    // streaming + download options per part.
+    const partsLines = [``, `<b>Parts (${partCount}):</b>`];
     for (let i = 0; i < parts.length; i++) {
       const p = parts[i];
       const pSize = p.human_size || humanSize(p.size);
       const pName = escapeHtml(p.filename || `part_${i + 1}`);
+      const pid = extractPixeldrainId(p.url) || extractPixeldrainId(p.raw_url);
       const pUrl = escapeHtml(p.url || "");
-      partsLines.push(`${i + 1}. ${pName} (${pSize}) → <a href="${pUrl}">/u/${extractPixeldrainId(p.url) || "?"}</a>`);
+      const gcoreUrl = pid ? buildGcoreStreamUrl(pid) : null;
+
+      partsLines.push(`${i + 1}. <b>${pName}</b> (${pSize})`);
+      partsLines.push(`   📦 <a href="${pUrl}">PixelDrain</a>`);
+      if (gcoreUrl) {
+        partsLines.push(`   🚀 <a href="${escapeHtml(gcoreUrl)}">GCore Stream</a>`);
+      }
     }
 
     const messageText = [
@@ -182,13 +184,13 @@ export default async function handler(req, res) {
       `Total Size: ${size}`,
       `Parts: ${partCount}`,
       ``,
-      `🎬 <b>M3U playlist attached below</b> — open in VLC to play all parts sequentially`,
+      `🎬 <b>M3U playlist attached below</b> — open in VLC to play all parts sequentially (uses GCore CDN URLs)`,
       ``,
       ...partsLines,
       ``,
       `♾️ Pixeldrain files do not expire`,
       ``,
-      `<i>Tap a button to copy M3U / stream a part / download all URLs.</i>`,
+      `<i>Tap a button to copy M3U / stream all / download all URLs.</i>`,
     ].join("\n");
 
     // Send the message with inline buttons
@@ -200,7 +202,7 @@ export default async function handler(req, res) {
     const m3uFilename = (filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80)) + ".m3u";
     const m3uContent = buildM3UContent(filename, parts);
     try {
-      await sendDocument(chatId, m3uFilename, m3uContent, `📋 M3U Playlist — ${partCount} parts`);
+      await sendDocument(chatId, m3uFilename, m3uContent, `📋 M3U Playlist — ${partCount} parts (GCore CDN)`);
     } catch (err) {
       console.error("[result:sendDocument] M3U attach failed:", err.message);
       // Non-fatal — the inline Copy M3U button still works
@@ -210,9 +212,11 @@ export default async function handler(req, res) {
   }
 
   // ── Single file upload (normal case, <10GB) ──
+  // v8.5: Show BOTH PixelDrain AND GCore links, with buttons for each.
   const pixeldrainId = extractPixeldrainId(body.url);
   const directUrl = body.url || (pixeldrainId ? `https://pixeldrain.com/u/${pixeldrainId}` : "");
   const rawUrl = body.raw_url || (pixeldrainId ? `https://pixeldrain.com/api/file/${pixeldrainId}` : "");
+  const gcoreStreamUrl = pixeldrainId ? buildGcoreStreamUrl(pixeldrainId) : null;
 
   // callback_data format:
   //   open:<id>      — 14 bytes max
@@ -221,9 +225,11 @@ export default async function handler(req, res) {
   const inlineKeyboard = [];
   if (pixeldrainId) {
     inlineKeyboard.push([
-      { text: "📂 Open", callback_data: `open:${pixeldrainId}` },
-      { text: "▶️ Stream", callback_data: `stream:${pixeldrainId}` },
-      { text: "📋 Copy", callback_data: `copy:${pixeldrainId}` },
+      { text: "📂 Open PixelDrain", callback_data: `open:${pixeldrainId}` },
+      { text: "▶️ Stream GCore", callback_data: `stream:${pixeldrainId}` },
+    ]);
+    inlineKeyboard.push([
+      { text: "📋 Copy All URLs", callback_data: `copy:${pixeldrainId}` },
     ]);
   }
 
@@ -233,12 +239,16 @@ export default async function handler(req, res) {
     `File: <b>${escapeHtml(filename)}</b>`,
     `Size: ${size}`,
     ``,
-    `🔗 <b>Direct Download:</b>`,
+    `📦 <b>PixelDrain Download:</b>`,
     `<a href="${escapeHtml(directUrl)}">${escapeHtml(directUrl)}</a>`,
   ];
 
   if (rawUrl && rawUrl !== directUrl) {
-    msgLines.push(``, `⬇️ <b>Raw (VLC / downloaders):</b>`, `<code>${escapeHtml(rawUrl)}</code>`);
+    msgLines.push(``, `⬇️ <b>PixelDrain Raw (VLC / downloaders):</b>`, `<code>${escapeHtml(rawUrl)}</code>`);
+  }
+
+  if (gcoreStreamUrl) {
+    msgLines.push(``, `🚀 <b>GCore Stream (CDN edge):</b>`, `<a href="${escapeHtml(gcoreStreamUrl)}">${escapeHtml(gcoreStreamUrl)}</a>`);
   }
 
   msgLines.push(``, `♾️ Pixeldrain files do not expire`);
